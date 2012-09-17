@@ -8,7 +8,7 @@
                   kernel,
                   stdlib
                  ]},
-  {mod, { gen_server_pool_app, []}},
+  {mod, { gen_server_pool, []}},
   {env, []}
  ]}.
 
