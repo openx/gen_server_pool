@@ -1,14 +1,13 @@
 {application, gen_server_pool,
  [
-  {description, ""},
-  {vsn, "2.0.0"},
-  {modules, [gen_server_pool]},
+  {description, "A gen_server pooling library."},
+  {vsn, "2.0.2"},
+  {modules, []},
   {registered, []},
   {applications, [
                   kernel,
                   stdlib
                  ]},
-  {mod, { gen_server_pool, []}},
   {env, []}
  ]}.
 
