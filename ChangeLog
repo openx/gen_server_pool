@@ -1,2 +1,5 @@
+version 2.0.0 Anthony Molinaro (anthony.molinaro@openx.com)
+  * support use of gen_server:reply/2
+
 version 1.0.0 Joel Meyer (joel@openx.org)
   * Initial public release of gen_server_pool

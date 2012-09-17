@@ -25,7 +25,9 @@
 -record( state, { manager_pid,
                   proxy_ref,
                   module,
-                  state } ).
+                  noreply_target,
+                  state
+                } ).
 
 %%====================================================================
 %% API
@@ -64,12 +66,16 @@ handle_call( { ProxyRef, stop },
   { stop, normal, ok, PState };
 
 handle_call( Msg,
-             From,
+             {_, FromRef}  = From,
              #state{ manager_pid = MgrPid,
                      proxy_ref   = ProxyRef,
                      module      = M,
                      state       = S } = PState ) ->
-  case M:handle_call( Msg, From, S ) of
+  % we are switching out the pid in the From field with the pid of this
+  % proxy, since if an embedded gen_server is using gen_server:reply/2
+  % and thus using the noreply forms, we don't want to make the resource
+  % available.
+  case M:handle_call( Msg, { self(), FromRef }, S ) of
     { reply, Reply, NewS } ->
       gen_server_pool:available( MgrPid, ProxyRef, self() ),
       { reply, Reply, state( PState, NewS ) };
@@ -77,11 +83,9 @@ handle_call( Msg,
       gen_server_pool:available( MgrPid, ProxyRef, self() ),
       { reply, Reply, state( PState, NewS ), Extra };
     { noreply, NewS } ->
-      gen_server_pool:available( MgrPid, ProxyRef, self() ),
-      { noreply, state( PState, NewS ) };
+      { noreply, state( PState#state{ noreply_target = From }, NewS ) };
     { noreply, NewS, Extra } ->
-      gen_server_pool:available( MgrPid, ProxyRef, self() ),
-      { noreply, state( PState, NewS ), Extra };
+      { noreply, state( PState#state{ noreply_target = From }, NewS ), Extra };
     { stop, Reason, Reply, NewS } ->
       { stop, Reason, Reply, state( PState, NewS ) };
     { stop, Reason, NewS } ->
@@ -106,17 +110,25 @@ handle_cast( Msg,
   end.
 
 
-handle_info( Msg,
+% handle_info normally doesn't make resources available as it is used for
+% things like gen_tcp/udp and other internal messaging.
+%
+% trap proxied noreply responses and send them back to the noreply_target.
+handle_info( {Tag, ProxyMsg},
              #state{ manager_pid = MgrPid,
-                     proxy_ref   = ProxyRef,
-                     module      = M,
+                     proxy_ref = ProxyRef,
+                     noreply_target = {Target,Tag}
+                   } = PState ) ->
+  Target ! { Tag, ProxyMsg },
+  gen_server_pool:available( MgrPid, ProxyRef, self() ),
+  { noreply, PState#state{ noreply_target = undefined } };
+handle_info( Msg,
+             #state{ module      = M,
                      state       = S } = PState ) ->
   case M:handle_info( Msg, S ) of
     { noreply, NewS } ->
-      gen_server_pool:available( MgrPid, ProxyRef, self() ),
       { noreply, state( PState, NewS ) };
     { noreply, NewS, Extra } ->
-      gen_server_pool:available( MgrPid, ProxyRef, self() ),
       { noreply, state( PState, NewS ), Extra };
     { stop, Reason, NewS } ->
       { stop, Reason, state( PState, NewS ) }

@@ -1,7 +1,7 @@
 {application, gen_server_pool,
  [
   {description, ""},
-  {vsn, "1.0.0"},
+  {vsn, "2.0.0"},
   {modules, [gen_server_pool]},
   {registered, []},
   {applications, [
