@@ -130,16 +130,12 @@ handle_call( {unavailable, Pid}, _From, State ) ->
   NState = worker_unavailable( Pid, State ),
   { reply, {ok, Pid}, NState };
 
-handle_call( Call, From, State=#state{ max_queued_tasks=infinity }) ->
-  { noreply, handle_request( { '$gen_call', From, Call }, State ) };
-handle_call( _Call, _From, State=#state{ num_queued_tasks=NumTasks,
-                                       num_dropped_tasks=DroppedTasks,
-                                       max_queued_tasks=MaxTasks,
-                                       module = _Module}) 
-                                       when NumTasks > MaxTasks ->
-  { reply, {error, request_dropped}, State#state{ num_dropped_tasks = DroppedTasks + 1} };
 handle_call( Call, From, State ) ->
-  { noreply, handle_request( { '$gen_call', From, Call }, State ) }.
+  case handle_request ({ '$gen_call', From, Call }, State) of
+    {ok, NewState} -> { noreply, NewState };
+    {Error, NewState} -> {reply, Error, NewState}
+  end.
+
 %%--------------------------------------------------------------------
 %% Function: handle_cast(Msg, State) -> {noreply, State} |
 %%                                      {noreply, State, Timeout} |
@@ -148,17 +144,12 @@ handle_call( Call, From, State ) ->
 %%--------------------------------------------------------------------
 handle_cast( { ProxyRef, worker_available, PidTime },
              State = #state{ proxy_ref = ProxyRef } ) ->
-  { noreply, worker_available( PidTime, State ) };
+  {_, NewState} = worker_available (PidTime, State),
+  {noreply, NewState};
 
-handle_cast( Cast, State=#state{ max_queued_tasks=infinity }) ->
-  { noreply, handle_request( { '$gen_cast', Cast }, State ) };
-handle_cast( _Cast, State=#state{ num_queued_tasks=NumTasks,
-                                 num_dropped_tasks=DroppedTasks,
-                                 max_queued_tasks=MaxTasks }) 
-                               when NumTasks > MaxTasks ->
-  { noreply, State#state{ num_dropped_tasks = DroppedTasks + 1} };
 handle_cast( Cast, State ) ->
-  { noreply, handle_request( {'$gen_cast', Cast }, State ) }.
+  { _, NewState } = handle_request ({'$gen_cast', Cast }, State ),
+  { noreply, NewState }.
 
 %%--------------------------------------------------------------------
 %% Function: handle_info(Info, State) -> {noreply, State} |
@@ -183,15 +174,9 @@ handle_info( { ProxyRef, check_idle_timeouts },
   schedule_idle_check( State ),
   { noreply, check_idle_timeouts( State ) }; 
 
-handle_info( Info, State=#state{ max_queued_tasks=infinity }) ->
-  { noreply, handle_request( Info, State ) };
-handle_info( _Info, State=#state{ num_queued_tasks=NumTasks,
-                                 num_dropped_tasks=DroppedTasks,
-                                 max_queued_tasks=MaxTasks }) 
-                               when NumTasks > MaxTasks ->
-  { noreply, State#state{ num_dropped_tasks = DroppedTasks + 1} };
 handle_info( Info, State ) ->
-  { noreply, handle_request( Info, State ) }.
+  { _, NewState } = handle_request (Info, State ),
+  { noreply, NewState }.
 
 %%--------------------------------------------------------------------
 %% Function: terminate(Reason, State) -> void()
@@ -219,9 +204,6 @@ handle_request( Req, State = #state{ requests = { Push, Pop },
   do_work( State#state{ requests = { [ Req | Push ], Pop }, 
                         num_queued_tasks=NumTasks+1} ).
 
-%  do_work( State#state{ requests = { [ Req | Push ], Pop }} ).
-
-
 worker_available( { Pid, Time }, State = #state{ available = Workers } ) ->
   % If a child sent a message to itself then it could already be in the list
   case proplists:is_defined( Pid, Workers ) of
@@ -235,7 +217,6 @@ worker_unavailable( Pid, State = #state{ available = Workers } ) ->
 
 stats( #state{ sup_pid   = SupPid,
                available = Workers,
-%               requests  = { Push, Pop },
                wm_size = WmSize, 
                wm_active = WmActive, 
                wm_tasks = WmTasks,
@@ -245,15 +226,19 @@ stats( #state{ sup_pid   = SupPid,
   Size   = proplists:get_value( active, supervisor:count_children( SupPid ) ),
   Idle   = length( Workers ),
   Active = Size - Idle,
-%  Tasks  = length( Push ) + length( Pop ),
   WmIdle = WmSize - WmActive,
-  [ { size, Size }, { active, Active }, { idle, Idle }, { tasks, NumTasks },
-    { wmsize, WmSize}, { wmactive, WmActive}, { wmidle, WmIdle}, { wmtasks, WmTasks},
+  [ { size, Size },
+    { active, Active },
+    { idle, Idle },
+    { tasks, NumTasks },
+    { wmsize, WmSize},
+    { wmactive, WmActive},
+    { wmidle, WmIdle},
+    { wmtasks, WmTasks},
     { drops, NumDroppedTasks}
   ].
 
 collect_stats ( State = #state{ sup_pid = SupPid,
-%                                requests = { Push, Pop },
                                 available = Workers,
                                 wm_size = WmSize, wm_active = WmActive, 
                                 wm_tasks = WmTasks,
@@ -261,12 +246,11 @@ collect_stats ( State = #state{ sup_pid = SupPid,
   Size   = proplists:get_value( active, supervisor:count_children( SupPid ) ),
   Idle   = length( Workers ),
   Active = Size - Idle,
-%  Tasks  = length( Push ) + length( Pop ),
   Tasks  = NumTasks,
 
-  NewWmSize = max(Size,WmSize),
+  NewWmSize = max (Size,WmSize),
   NewWmActive = max (Active, WmActive),
-  NewWmTasks = max(Tasks, WmTasks),
+  NewWmTasks = max (Tasks, WmTasks),
 
   State#state{wm_size = NewWmSize, wm_active = NewWmActive, wm_tasks = NewWmTasks}.
 
@@ -283,33 +267,51 @@ emit_stats( #state{ prog_id = ProgId, pool_id = PoolId } = S ) ->
 
   mondemand:send_stats( ProgId, [], M ),
   % reset stats after emit
-  S#state{ 
+  S#state{
      wm_size = 0,
      wm_active = 0,
      wm_tasks = 0,
      num_dropped_tasks=0
   }.
 
-
 % reset stats after emit
 terminate_pool( _Reason, _State ) ->
   ok.
-  
+
 do_work( State = #state{ requests  = { [], [] } } ) ->
   % No requests - do nothing.
-  State;
+  {ok, State};
 
 do_work( State = #state{ available = [],
-                         requests  = { _Push, _Pop },
+                         requests  = { Push, [ _ | Pop ] },
                          max_size  = MaxSize,
-                         sup_pid   = SupPid } ) ->
+                         sup_pid   = SupPid,
+                         num_queued_tasks = NumTasks,
+                         num_dropped_tasks = DroppedTasks,
+                         max_queued_tasks = MaxTasks
+                 } ) ->
   % Requests, but no workers - check if we can start a worker.
   PoolSize = proplists:get_value( active, supervisor:count_children( SupPid ) ),
   case PoolSize < MaxSize of
-    true  -> gen_server_pool_sup:add_child( SupPid );
-    false -> ok
-  end,
-  State;
+    true  ->
+      gen_server_pool_sup:add_child( SupPid ),
+      {ok, State};
+    false -> 
+      % we are at max pool size, so allow queuing to occur
+      case MaxTasks =/= infinity orelse NumTasks > MaxTasks of
+        true ->
+          % queue too big, so drop the request
+          { {error, request_dropped },
+            State#state {
+              requests = {Push, Pop},
+              num_queued_tasks = NumTasks - 1,
+              num_dropped_tasks = DroppedTasks + 1
+            }
+          };
+        false ->
+          { ok, State }
+      end
+  end;
 
 do_work( State = #state{ requests  = { Push, [] } } ) ->
   do_work( State#state{ requests = { [], lists:reverse( Push ) } } );
@@ -322,9 +324,10 @@ do_work( State = #state{ available = [ { Pid, _ } | Workers ],
       do_work( State#state{ available = Workers } );
     true  ->
       erlang:send( Pid, Req, [noconnect] ),
-      State#state{ available = Workers,
-                   requests  = { Push, Pop },
-                   num_queued_tasks=NumTasks-1}
+      {ok, State#state{ available = Workers,
+                        requests  = { Push, Pop },
+                        num_queued_tasks=NumTasks-1}
+      }
   end.
 
 assure_min_pool_size( #state{ min_size = MinSize, sup_pid = SupPid } = S ) ->

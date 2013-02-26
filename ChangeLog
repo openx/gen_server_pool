@@ -1,3 +1,9 @@
+Version 2.1.0 Anthony Molinaro (anthony.molinaro@openx.com)
+  * Queuing was broken when the maximum length was set to zero
+
+Version 2.0.2 Anthony Molinaro (anthony.molinaro@openx.com)
+  * fix .app file
+
 version 2.0.0 Anthony Molinaro (anthony.molinaro@openx.com)
   * support use of gen_server:reply/2
 
