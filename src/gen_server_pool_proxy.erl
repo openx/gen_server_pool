@@ -26,6 +26,7 @@
                   proxy_ref,
                   module,
                   noreply_target,
+                  worker_starttime,
                   state
                 } ).
 
@@ -46,14 +47,16 @@ stop( Pid, ProxyRef ) ->
 init( [ MgrPid, ProxyRef, Module, Args ] ) ->
   PState = #state{ manager_pid = MgrPid,
                    proxy_ref   = ProxyRef,
-                   module      = Module },
+                   module      = Module,
+                   worker_starttime = io:timestamp()
+                    },
 
   case Module:init( Args ) of
     { ok, State } ->
-      gen_server_pool:available( MgrPid, ProxyRef, self() ),
+      gen_server_pool:available( MgrPid, ProxyRef, self(), PState#state.worker_starttime ),
       { ok, state( PState, State ) };
     { ok, State, Extra } ->
-      gen_server_pool:available( MgrPid, ProxyRef, self() ),
+      gen_server_pool:available( MgrPid, ProxyRef, self(), PState#state.worker_starttime ),
       { ok, state( PState, State ), Extra };
     Other ->
       Other
@@ -70,6 +73,7 @@ handle_call( Msg,
              #state{ manager_pid = MgrPid,
                      proxy_ref   = ProxyRef,
                      module      = M,
+                     worker_starttime = WorkerStartTime,
                      state       = S } = PState ) ->
   % we are switching out the pid in the From field with the pid of this
   % proxy, since if an embedded gen_server is using gen_server:reply/2
@@ -77,10 +81,10 @@ handle_call( Msg,
   % available.
   case M:handle_call( Msg, { self(), FromRef }, S ) of
     { reply, Reply, NewS } ->
-      gen_server_pool:available( MgrPid, ProxyRef, self() ),
+      gen_server_pool:available( MgrPid, ProxyRef, self(), WorkerStartTime ),
       { reply, Reply, state( PState, NewS ) };
     { reply, Reply, NewS, Extra } ->
-      gen_server_pool:available( MgrPid, ProxyRef, self() ),
+      gen_server_pool:available( MgrPid, ProxyRef, self(), WorkerStartTime ),
       { reply, Reply, state( PState, NewS ), Extra };
     { noreply, NewS } ->
       { noreply, state( PState#state{ noreply_target = From }, NewS ) };
@@ -97,13 +101,14 @@ handle_cast( Msg,
              #state{ manager_pid = MgrPid,
                      proxy_ref   = ProxyRef,
                      module      = M,
+                     worker_starttime = WorkerStartTime,
                      state       = S } = PState ) ->
   case M:handle_cast( Msg, S ) of
     { noreply, NewS } ->
-      gen_server_pool:available( MgrPid, ProxyRef, self() ),
+      gen_server_pool:available( MgrPid, ProxyRef, self(), WorkerStartTime ),
       { noreply, state( PState, NewS ) };
     { noreply, NewS, Extra } ->
-      gen_server_pool:available( MgrPid, ProxyRef, self() ),
+      gen_server_pool:available( MgrPid, ProxyRef, self(), WorkerStartTime ),
       { noreply, state( PState, NewS ), Extra };
     { stop, Reason, NewS } ->
       { stop, Reason, state( PState, NewS ) }
@@ -117,10 +122,11 @@ handle_cast( Msg,
 handle_info( {Tag, ProxyMsg},
              #state{ manager_pid = MgrPid,
                      proxy_ref = ProxyRef,
+                     worker_starttime = WorkerStartTime,
                      noreply_target = {Target,Tag}
                    } = PState ) ->
   Target ! { Tag, ProxyMsg },
-  gen_server_pool:available( MgrPid, ProxyRef, self() ),
+  gen_server_pool:available( MgrPid, ProxyRef, self(), WorkerStartTime ),
   { noreply, PState#state{ noreply_target = undefined } };
 handle_info( Msg,
              #state{ module      = M,
