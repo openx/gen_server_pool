@@ -48,7 +48,7 @@ init( [ MgrPid, ProxyRef, Module, Args ] ) ->
   PState = #state{ manager_pid = MgrPid,
                    proxy_ref   = ProxyRef,
                    module      = Module,
-                   worker_starttime = io:timestamp()
+                   worker_starttime = os:timestamp()
                     },
 
   case Module:init( Args ) of

@@ -309,7 +309,7 @@ do_work( State = #state{ available = [],
       {ok, State};
     false -> 
       % we are at max pool size, so allow queuing to occur
-      case MaxTasks =/= infinity orelse NumTasks > MaxTasks of
+      case MaxTasks =/= infinity andalso NumTasks > MaxTasks of
         true ->
           % queue too big, so drop the request
           { {error, request_dropped },
@@ -352,6 +352,8 @@ do_work( State = #state{ proxy_ref = ProxyRef,
        end
   end.
 
+worker_too_old (_WorkerStartTime, infinity) ->
+  false;
 worker_too_old (WorkerStartTime, MaxWorkerAge) ->
   Now = os:timestamp(),
   WorkerAge = seconds_between( Now, WorkerStartTime ),
@@ -451,6 +453,8 @@ parse_opts( [ { idle_timeout, V } | Opts ], State ) ->
   parse_opts( Opts, State#state{ idle_secs = V } );
 parse_opts( [ { max_queue, V } | Opts ], State ) ->
   parse_opts( Opts, State#state{ max_queued_tasks = V } );
+parse_opts( [ { max_worker_age, V } | Opts ], State ) ->
+  parse_opts( Opts, State#state{ max_worker_age = V } );
 parse_opts( [ { sup_max_r, V } | Opts ], State ) ->
   parse_opts( Opts, State#state{ sup_max_r = V } );
 parse_opts( [ { sup_max_t, V } | Opts ], State ) ->
