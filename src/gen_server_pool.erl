@@ -276,7 +276,6 @@ emit_stats( #state{ prog_id = ProgId, pool_id = PoolId } = S ) ->
      num_dropped_tasks=0
   }.
 
-% reset stats after emit
 terminate_pool( _Reason, _State ) ->
   ok.
 
@@ -450,8 +449,8 @@ parse_opts( [ { sup_max_r, V } | Opts ], State ) ->
   parse_opts( Opts, State#state{ sup_max_r = V } );
 parse_opts( [ { sup_max_t, V } | Opts ], State ) ->
   parse_opts( Opts, State#state{ sup_max_t = V } );
-parse_opts( [ { stats, _ } | Opts ], State ) ->
-  % stats option is not set to status
+parse_opts( [ { mondemand, _ } | Opts ], State ) ->
+  % stats option is not set in state
   parse_opts( Opts, State ).
 
 
@@ -465,11 +464,12 @@ finalize( State ) ->
 
 setup_schedule( State, PoolOpts ) ->
   % collect stats as default
-  case proplists:get_value( stats, PoolOpts, true ) of
+  schedule_collect_stats( State ),
+
+  % but make emission to mondemand optional
+  case proplists:get_value( mondemand, PoolOpts, true ) of
     false -> ok;
-    _ ->
-      schedule_collect_stats( State ),
-      schedule_emit_stats( State )
+    _ -> schedule_emit_stats( State )
   end,
 
   % start min_pool_size workers and schedule idle time check
