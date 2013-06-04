@@ -1,3 +1,7 @@
+Version 2.1.1 Eric Kim (ekim@openx.com)
+  * Fix queueing bug, caused by simple logic error 
+	* Add support for max_worker_age
+
 Version 2.1.0 Anthony Molinaro (anthony.molinaro@openx.com)
   * Queuing was broken when the maximum length was set to zero
 
