@@ -107,17 +107,8 @@ init( [ Module, Args, Options, PoolOpts ] ) ->
                                                    Module, Args, Options,
                                                    MaxR, MaxT ),
 
-  State = S#state{ sup_pid = SupPid },
-
-  case assure_min_pool_size( State ) of
-    ok ->
-      schedule_idle_check( State ),
-      schedule_collect_stats( State ),
-      schedule_emit_stats( State ),
-      { ok, State };
-    Error ->
-      { stop, Error }
-  end.
+  % schedule periodic processing and start workers
+  setup_schedule( S#state{ sup_pid = SupPid }, PoolOpts ).
 
 
 %%--------------------------------------------------------------------
@@ -458,7 +449,10 @@ parse_opts( [ { max_worker_age, V } | Opts ], State ) ->
 parse_opts( [ { sup_max_r, V } | Opts ], State ) ->
   parse_opts( Opts, State#state{ sup_max_r = V } );
 parse_opts( [ { sup_max_t, V } | Opts ], State ) ->
-  parse_opts( Opts, State#state{ sup_max_t = V } ).
+  parse_opts( Opts, State#state{ sup_max_t = V } );
+parse_opts( [ { stats, _ } | Opts ], State ) ->
+  % stats option is not set to status
+  parse_opts( Opts, State ).
 
 
 finalize( #state{ sup_max_r = undefined, max_size = Sz } = S ) ->
@@ -468,6 +462,24 @@ finalize( State ) ->
   % Add unique reference for this proxy
   State#state{ proxy_ref = make_ref() }.
 
+
+setup_schedule( State, PoolOpts ) ->
+  % collect stats as default
+  case proplists:get_value( stats, PoolOpts, true ) of
+    false -> ok;
+    _ ->
+      schedule_collect_stats( State ),
+      schedule_emit_stats( State )
+  end,
+
+  % start min_pool_size workers and schedule idle time check
+  case assure_min_pool_size( State ) of
+    ok ->
+      schedule_idle_check( State ),
+      { ok, State };
+    Error ->
+      { stop, Error }
+  end.
 
 %%--------------------------------------------------------------------
 %%% Tests
