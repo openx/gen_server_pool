@@ -1,7 +1,7 @@
 {application, gen_server_pool,
  [
   {description, "A gen_server pooling library."},
-  {vsn, "2.2.0"},
+  {vsn, "2.3.0"},
   {modules, []},
   {registered, []},
   {applications, [
