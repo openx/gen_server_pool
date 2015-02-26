@@ -1,5 +1,5 @@
 Version 2.2.0 Eric Kim (ekim@openx.com)
-  * Fix queueing bug, caused by simple logic error 
+  * Fix queueing bug, caused by simple logic error
   * Add support for max_worker_age
   * Support turning off stats emission by adding { mondemand, false } to
 options
