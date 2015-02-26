@@ -1,3 +1,6 @@
+Version 2.3.0 Vikram Kadi(vikram.kadi@openx.com)
+  * Added a new config parameter request_max_wait.
+
 Version 2.2.0 Eric Kim (ekim@openx.com)
   * Fix queueing bug, caused by simple logic error
   * Add support for max_worker_age

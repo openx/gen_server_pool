@@ -45,14 +45,17 @@
                  wm_size = 0,
                  wm_active = 0,
                  wm_tasks = 0,
-                 max_worker_age = infinity
+                 max_worker_age = infinity,
+                 max_worker_wait = infinity
                  }).
 -record(worker, {
-          pid, 
+          pid,
           available_time,
           start_time
 }).
-         
+
+-record(request, { call_args,
+                   arrival_time }).
 
 %%====================================================================
 %% API
@@ -202,8 +205,11 @@ code_change( _OldVsn, State, _Extra ) ->
 %%--------------------------------------------------------------------
 handle_request( Req, State = #state{ requests = { Push, Pop },
                                      num_queued_tasks=NumTasks } ) ->
-  do_work( State#state{ requests = { [ Req | Push ], Pop }, 
+  do_work( State#state{ requests = { [ timestamped_request(Req) | Push ], Pop },
                         num_queued_tasks=NumTasks+1} ).
+
+timestamped_request(Req) ->
+  #request{call_args=Req, arrival_time=os:timestamp()}.
 
 worker_available( Worker = #worker{ pid = Pid }, 
                   State = #state{ available = Workers } ) ->
@@ -319,28 +325,41 @@ do_work( State = #state{ requests  = { Push, [] } } ) ->
 
 do_work( State = #state{ proxy_ref = ProxyRef,
                          available = [ #worker{ pid = Pid, start_time = WorkerStartTime } | Workers ],
-                         requests  = { Push, [ Req | Pop ] },
+                         requests  = { Push, [ Req=#request{call_args=CallArgs={_, From, _}}  | Pop ] },
                          num_queued_tasks = NumTasks,
                          max_worker_age = MaxWorkerAge }) ->
-  case is_process_alive(Pid) of
+  case request_past_deadline(Req, State) of
+    true -> gen_server:reply(From, {error, request_timeout}),
+            {ok, State#state{ available = Workers,
+                              requests  = { Push, Pop},
+                              num_queued_tasks=NumTasks-1}}; 
     false ->
-      do_work( State#state{ available = Workers } );
-    true  ->
-      %% Check worker age here, and boot it if too old
-      case worker_too_old(WorkerStartTime, MaxWorkerAge) of
-        true -> 
-          % Kill the old worker, and check the min pool size
-          gen_server_pool_proxy:stop( Pid, ProxyRef ),
-          assure_min_pool_size( State ),
-          do_work( State#state { available = Workers } );
+      case is_process_alive(Pid) of
         false ->
-          erlang:send( Pid, Req, [noconnect] ),
-          {ok, State#state{ available = Workers,
-                            requests  = { Push, Pop },
-                            num_queued_tasks=NumTasks-1}
-          }
-       end
-  end.
+          do_work( State#state{ available = Workers } );
+        true  ->
+          %% Check worker age here, and boot it if too old
+          case worker_too_old(WorkerStartTime, MaxWorkerAge) of
+            true ->
+              % Kill the old worker, and check the min pool size
+              gen_server_pool_proxy:stop( Pid, ProxyRef ),
+              assure_min_pool_size( State ),
+              do_work( State#state { available = Workers } );
+            false ->
+              erlang:send( Pid, CallArgs, [noconnect] ),
+              {ok, State#state{ available = Workers,
+                                requests  = { Push, Pop },
+                                num_queued_tasks=NumTasks-1}
+              }
+           end
+      end
+   end.
+
+request_past_deadline( _, #state{max_worker_wait=infinity} ) -> false;
+request_past_deadline( #request{arrival_time=BeginTime},
+    #state{max_worker_wait=MaxTimeInMillis} ) ->
+  ElapsedTime=(timer:now_diff(os:timestamp(), BeginTime) / 1000),
+  ElapsedTime >= MaxTimeInMillis.
 
 worker_too_old (_WorkerStartTime, infinity) ->
   false;
@@ -348,7 +367,6 @@ worker_too_old (WorkerStartTime, MaxWorkerAge) ->
   Now = os:timestamp(),
   WorkerAge = seconds_between( Now, WorkerStartTime ),
   WorkerAge >= MaxWorkerAge.
-  
 
 assure_min_pool_size( #state{ min_size = MinSize, sup_pid = SupPid } = S ) ->
   PoolSize = proplists:get_value( active, supervisor:count_children( SupPid ) ),
@@ -449,6 +467,8 @@ parse_opts( [ { sup_max_r, V } | Opts ], State ) ->
   parse_opts( Opts, State#state{ sup_max_r = V } );
 parse_opts( [ { sup_max_t, V } | Opts ], State ) ->
   parse_opts( Opts, State#state{ sup_max_t = V } );
+parse_opts( [ { request_max_wait, V } | Opts ], State ) ->
+  parse_opts( Opts, State#state{ max_worker_wait = V } );
 parse_opts( [ { mondemand, _ } | Opts ], State ) ->
   % stats option is not set in state
   parse_opts( Opts, State ).
