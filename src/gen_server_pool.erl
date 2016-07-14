@@ -28,6 +28,7 @@
           code_change/3 ]).
 
 -define(EMPTY_QUEUE, {[], []}).                 % Define empty queue for pattern matching.
+-define(M, 1000000).
 
 -record(state, { proxy_ref,
                  sup_pid,
@@ -414,34 +415,84 @@ check_idle_timeouts( #state{ proxy_ref = ProxyRef,
                              sup_pid = SupPid,
                              idle_secs = IdleSecs,
                              available = Available,
-                             min_size = MinSize } = S ) ->
+                             min_size = MinSize,
+                             max_worker_age = MaxWorkerAge } = S ) ->
+  Now = os:timestamp(),
+
+  MaxAgeTimeKill =
+    case MaxWorkerAge of
+      infinity -> undefined;
+      _        -> now_sub( Now, MaxWorkerAge * ?M )
+    end,
+  Survivors0 = kill_aged_workers( ProxyRef, MaxAgeTimeKill, Available, [] ),
+
   PoolSize = proplists:get_value( active, supervisor:count_children( SupPid ) ),
   MaxWorkersToKill = PoolSize - MinSize,
-  Survivors = kill_idle_workers (ProxyRef,IdleSecs,Available, [], MaxWorkersToKill),
+  MaxIdleTimeKill = now_sub( os:timestamp(), IdleSecs * ?M ),
+  Survivors = kill_idle_workers( ProxyRef, MaxIdleTimeKill, Survivors0, [], MaxWorkersToKill ),
 
   State = S#state{ available = Survivors },
   assure_min_pool_size( State ),
 
   State.
 
-kill_idle_workers(_ProxyRef,_IdleSecs,Available, Survivors, MaxWorkersToKill)  when MaxWorkersToKill =< 0 ->
-  Available ++ Survivors;
-kill_idle_workers(_ProxyRef,_IdleSecs,[], Survivors, _MaxWorkersToKill) ->
+%% Enforce max_worker_age and prune the worker list of dead processes.  This
+%% function reverses the order of the worker list; it will be reversed again
+%% by kill_idle_workers.  maintaining the order of the worker list.
+kill_aged_workers( _ProxyRef, _TimeKill, [], Survivors ) ->
   Survivors;
-kill_idle_workers(ProxyRef,IdleSecs,[Worker=#worker{pid=Pid,available_time=Time} | Available], Survivors, MaxWorkersToKill) ->
-  Now = os:timestamp(),
-  IdleTime = seconds_between( Now, Time ),
-  case IdleTime >= IdleSecs of
+kill_aged_workers( ProxyRef, TimeKill, [ Worker = #worker{ pid = Pid, start_time = StartTime } | Available ], Survivors ) ->
+  case is_process_alive( Pid ) of
+    false     -> kill_aged_workers( ProxyRef, TimeKill, Available, Survivors );                 % Worker is dead; drop it.
     true ->
-      case is_process_alive(Pid) of
-        false -> kill_idle_workers(ProxyRef,IdleSecs, Available, Survivors, MaxWorkersToKill);
-        true ->
-          gen_server_pool_proxy:stop( Pid, ProxyRef ),
-          kill_idle_workers(ProxyRef,IdleSecs, Available, Survivors, MaxWorkersToKill-1)
-      end;
-    false ->
-      kill_idle_workers(ProxyRef,IdleSecs, Available, [ Worker | Survivors], MaxWorkersToKill)
+      case TimeKill =/= undefined andalso timer:now_diff( TimeKill, StartTime ) > 0 of
+        true  -> gen_server_pool_proxy:stop( Pid, ProxyRef ),                                   % Worker is alive, but too old; kill it.
+                 kill_aged_workers( ProxyRef, TimeKill, Available, Survivors );
+        false -> kill_aged_workers( ProxyRef, TimeKill, Available, [ Worker | Survivors ] )     % Worker is alive and not too old; keep it.
+      end
   end.
+
+%% Kill up to MaxWorkersToKill workers that have not been active since
+%% KillTime.
+%%
+%% We would prefer to kill the oldest workers, because those would be the
+%% first to be killed by kill_aged_workers.  We could do that by using a heap
+%% to track the MaxWorkersToKill oldest workers, but that is not implemented
+%% here.  Instead, we use the reversed worker list returned by
+%% kill_aged_workers; the workers that have been idle the longest are at the
+%% beginning of thise list, and we hope idle time is a weak proxy for age.
+%% This function reverses the order of the list again, meaning that the
+%% combination of kill_aged_workers and kill_idle_workers will leave the list
+%% in the original order.
+kill_idle_workers( _ProxyRef, _TimeKill, Available, Survivors, MaxWorkersToKill) when MaxWorkersToKill =< 0 ->
+  lists:reverse( Survivors, Available );
+kill_idle_workers( _ProxyRef, _TimeKill, [], Survivors, _MaxWorkersToKill) ->
+  lists:reverse( Survivors );
+kill_idle_workers( ProxyRef, TimeKill, [ Worker = #worker{ pid = Pid, available_time = IdleTime } | Available ], Survivors, MaxWorkersToKill ) ->
+  case timer:now_diff( TimeKill, IdleTime ) > 0 of
+    true  -> gen_server_pool_proxy:stop( Pid, ProxyRef ),                                               % Worker has been idle too long; kill it.
+             kill_idle_workers( ProxyRef, TimeKill, Available, Survivors, MaxWorkersToKill - 1 );
+    false -> kill_idle_workers( ProxyRef, TimeKill, Available, [ Worker | Survivors], MaxWorkersToKill )% Worker is ok; keep it.
+  end.
+
+
+now_sub( { Megas, Secs, Micros }, SubMicros ) ->
+  SubMicros0 = SubMicros rem ?M,
+  SubSecs0 = SubMicros div ?M,
+  {MicrosOut, SubSecs1} =
+    case Micros - SubMicros0 of
+      MicrosOut0 when MicrosOut0 >= 0 -> {MicrosOut0, SubSecs0};
+      MicrosOut0                      -> {MicrosOut0 + ?M, SubSecs0 + 1}
+    end,
+  SubSecs2 = SubSecs1 rem ?M,
+  SubMegas2 = SubSecs1 div ?M,
+  {SecsOut, SubMegas3} =
+    case Secs - SubSecs2 of
+      SecsOut0 when SecsOut0 >= 0 -> {SecsOut0, SubMegas2};
+      SecsOut0                    -> {SecsOut0 + ?M, SubMegas2 + 1}
+    end,
+  {Megas - SubMegas3, SecsOut, MicrosOut}.
+
 
 seconds_between( { MS1, S1, _ }, { MS1, S2, _ } ) ->
   S1 - S2;
@@ -525,4 +576,19 @@ setup_schedule( State, PoolOpts ) ->
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
--endif.
+now_sub_test() ->
+  ?assertEqual( { 1, 2, 3 },            now_sub( { 1, 2, 4 }, 1 )),
+  ?assertEqual( { 1, 2, 3 },            now_sub( { 1, 3, 3 }, ?M )),
+  ?assertEqual( { 1, 2, 3 },            now_sub( { 1, 3, 4 }, ?M + 1 )),
+  ?assertEqual( { 1, 2, 3 },            now_sub( { 1, 3, 2 }, ?M - 1 )),
+  ?assertEqual( { 1, 2, 3 },            now_sub( { 2, 2, 3 }, ?M * ?M )),
+  ?assertEqual( { 1, 2, 3 },            now_sub( { 2, 2, 4 }, ?M * ?M + 1 )),
+  ?assertEqual( { 1, 2, 3 },            now_sub( { 2, 2, 2 }, ?M * ?M - 1 )),
+  ?assertEqual( { 1, 2, 3 },            now_sub( { 2, 3, 3 }, ?M * ?M + ?M )),
+  ?assertEqual( { 1, 2, 3 },            now_sub( { 2, 1, 3 }, ?M * ?M - ?M )),
+  ?assertEqual( { 1, 2, 3 },            now_sub( { 2, 3, 4 }, ?M * ?M + ?M + 1 )),
+  ?assertEqual( { 0, 0, ?M - 1 },       now_sub( {0, 1, 0}, 1 )),
+  ?assertEqual( { 0, ?M - 1, 0 },       now_sub( {1, 0, 0}, ?M )),
+  ?assertEqual( { 0, ?M - 1, ?M - 1 },  now_sub( {1, 0, 0}, 1 )).
+
+-endif. %% TEST
