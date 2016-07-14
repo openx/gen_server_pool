@@ -325,14 +325,20 @@ do_work( State = #state{ requests  = { Push, [] } } ) ->
 
 do_work( State = #state{ proxy_ref = ProxyRef,
                          available = [ #worker{ pid = Pid, start_time = WorkerStartTime } | Workers ],
-                         requests  = { Push, [ Req=#request{call_args=CallArgs={_, From, _}}  | Pop ] },
+                         requests  = { Push, [ Req = #request{ call_args = CallArgs } | Pop ] },
                          num_queued_tasks = NumTasks,
                          max_worker_age = MaxWorkerAge }) ->
   case request_past_deadline(Req, State) of
-    true -> gen_server:reply(From, {error, request_timeout}),
-            {ok, State#state{ available = Workers,
-                              requests  = { Push, Pop},
-                              num_queued_tasks=NumTasks-1}}; 
+    true ->
+      case CallArgs of
+        { '$gen_call', From, _ } ->
+          gen_server:reply(From, {error, request_timeout});
+        _ -> %% cast or info.
+          ok
+      end,
+      {ok, State#state{ available = Workers,
+                        requests  = { Push, Pop },
+                        num_queued_tasks = NumTasks - 1 }};
     false ->
       case is_process_alive(Pid) of
         false ->
