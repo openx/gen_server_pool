@@ -27,12 +27,14 @@
           terminate/2,
           code_change/3 ]).
 
+-define(EMPTY_QUEUE, {[], []}).                 % Define empty queue for pattern matching.
+
 -record(state, { proxy_ref,
                  sup_pid,
                  sup_max_r,
                  sup_max_t = 1,
                  available = [],
-                 requests  = { [], [] },
+                 requests  = queue:new(),
                  min_size  = 0,
                  max_size  = 10,
                  idle_secs = infinity,
@@ -48,6 +50,7 @@
                  max_worker_age = infinity,
                  max_worker_wait = infinity
                  }).
+
 -record(worker, {
           pid,
           available_time,
@@ -271,9 +274,9 @@ terminate_pool( _Reason, _State ) ->
 -spec handle_request(term(), #state{}) -> #state{}.
 %% Handle a gen_server call, cast, or info request by proxying it to a
 %% gen_server_pool_proxy worker.
-handle_request( Req, State = #state{ requests = { Push, Pop },
+handle_request( Req, State = #state{ requests = Requests,
                                      num_queued_tasks = NumTasks } ) ->
-  do_work( State#state{ requests = { [ timestamped_request(Req) | Push ], Pop },
+  do_work( State#state{ requests = queue:in( timestamped_request(Req), Requests ),
                         num_queued_tasks = NumTasks + 1 } ).
 
 -spec worker_available(#worker{}, #state{}) -> #state{}.
@@ -294,36 +297,37 @@ worker_unavailable( Pid, State = #state{ available = Workers } ) ->
 
 
 -spec do_work(#state{}) -> #state{}.
-do_work( State = #state{ requests  = { [], [] } } ) ->
-  % No requests - do nothing.
+do_work( State = #state{ requests = ?EMPTY_QUEUE } ) ->
+  %% No requests - do nothing.
   State;
 
 do_work( State = #state{ available = [],
-                         requests  = { Push, [ #request{ call_args = CallArgs } | Pop ] },
+                         requests = Requests,
                          max_size  = MaxSize,
                          sup_pid   = SupPid,
                          num_queued_tasks = NumTasks,
                          num_dropped_tasks = DroppedTasks,
                          max_queued_tasks = MaxTasks
                  } ) ->
-  % Requests, but no workers - check if we can start a worker.
+  %% Requests, but no workers - check if we can start a worker.
   PoolSize = proplists:get_value( active, supervisor:count_children( SupPid ) ),
   case PoolSize < MaxSize of
     true  ->
       gen_server_pool_sup:add_child( SupPid ),
       State;
     false -> 
-      % we are at max pool size, so allow queuing to occur
+      %% We are at max pool size, so allow queuing to occur.
       case MaxTasks =/= infinity andalso NumTasks > MaxTasks of
         true ->
-          % queue too big, so drop the request
+          %% Queue too big, so drop the oldest request.
+          { { value, #request{ call_args = CallArgs } }, RequestsOut } = queue:out( Requests ),
           case CallArgs of
             { '$gen_call', From, _ } ->
               gen_server:reply( From, { error, request_dropped } );
             _ -> %% cast or info.
               ok
           end,
-          State#state{ requests = { Push, Pop },
+          State#state{ requests = RequestsOut,
                        num_queued_tasks = NumTasks - 1,
                        num_dropped_tasks = DroppedTasks + 1 };
         false ->
@@ -331,14 +335,12 @@ do_work( State = #state{ available = [],
       end
   end;
 
-do_work( State = #state{ requests  = { Push, [] } } ) ->
-  do_work( State#state{ requests = { [], lists:reverse( Push ) } } );
-
 do_work( State = #state{ proxy_ref = ProxyRef,
                          available = [ #worker{ pid = Pid, start_time = WorkerStartTime } | Workers ],
-                         requests  = { Push, [ Req = #request{ call_args = CallArgs } | Pop ] },
+                         requests = Requests,
                          num_queued_tasks = NumTasks,
                          max_worker_age = MaxWorkerAge }) ->
+  { { value, Req = #request{ call_args = CallArgs } }, RequestsOut } = queue:out( Requests ),
   case request_past_deadline(Req, State) of
     true ->
       case CallArgs of
@@ -348,7 +350,7 @@ do_work( State = #state{ proxy_ref = ProxyRef,
           ok
       end,
       State#state{ available = Workers,
-                   requests  = { Push, Pop },
+                   requests  = RequestsOut,
                    num_queued_tasks = NumTasks - 1 };
     false ->
       case is_process_alive(Pid) of
@@ -365,11 +367,12 @@ do_work( State = #state{ proxy_ref = ProxyRef,
             false ->
               erlang:send( Pid, CallArgs, [noconnect] ),
               State#state{ available = Workers,
-                           requests  = { Push, Pop },
+                           requests  = RequestsOut,
                            num_queued_tasks = NumTasks - 1 }
           end
       end
    end.
+
 
 request_past_deadline( _, #state{max_worker_wait=infinity} ) -> false;
 request_past_deadline( #request{arrival_time=BeginTime},
