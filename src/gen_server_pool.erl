@@ -131,11 +131,11 @@ handle_call( get_pool_pids, _From, State = #state{ sup_pid = SupPid } ) ->
   { reply, {ok, Children}, State };
 
 handle_call( {unavailable, Pid}, _From, State ) ->
-  NState = worker_unavailable( Pid, State ),
-  { reply, {ok, Pid}, NState };
+  NewState = worker_unavailable( Pid, State ),
+  { reply, {ok, Pid}, NewState };
 
 handle_call( Call, From, State ) ->
-  {_, NewState } = handle_request( { '$gen_call', From, Call }, State ),
+  NewState = handle_request( { '$gen_call', From, Call }, State ),
   { noreply, NewState }.
 
 %%--------------------------------------------------------------------
@@ -146,11 +146,11 @@ handle_call( Call, From, State ) ->
 %%--------------------------------------------------------------------
 handle_cast( { ProxyRef, worker_available, Worker=#worker{} },
              State = #state{ proxy_ref = ProxyRef } ) ->
-  {_, NewState} = worker_available (Worker, State),
+  NewState = worker_available( Worker, State ),
   {noreply, NewState};
 
 handle_cast( Cast, State ) ->
-  { _, NewState } = handle_request ({'$gen_cast', Cast }, State ),
+  NewState = handle_request( { '$gen_cast', Cast }, State ),
   { noreply, NewState }.
 
 %%--------------------------------------------------------------------
@@ -177,7 +177,7 @@ handle_info( { ProxyRef, check_idle_timeouts },
   { noreply, check_idle_timeouts( State ) }; 
 
 handle_info( Info, State ) ->
-  { _, NewState } = handle_request (Info, State ),
+  NewState = handle_request( Info, State ),
   { noreply, NewState }.
 
 %%--------------------------------------------------------------------
@@ -268,11 +268,16 @@ terminate_pool( _Reason, _State ) ->
   ok.
 
 
+-spec handle_request(term(), #state{}) -> #state{}.
+%% Handle a gen_server call, cast, or info request by proxying it to a
+%% gen_server_pool_proxy worker.
 handle_request( Req, State = #state{ requests = { Push, Pop },
                                      num_queued_tasks = NumTasks } ) ->
   do_work( State#state{ requests = { [ timestamped_request(Req) | Push ], Pop },
                         num_queued_tasks = NumTasks + 1 } ).
 
+-spec worker_available(#worker{}, #state{}) -> #state{}.
+%% Return a gen_server_pool_proxy worker to the pool.
 worker_available( Worker = #worker{ pid = Pid },
                   State = #state{ available = Workers } ) ->
   % If a child sent a message to itself then it could already be in the list
@@ -281,13 +286,17 @@ worker_available( Worker = #worker{ pid = Pid },
     false -> do_work( State#state{ available = [ Worker | Workers ] } )
   end.
 
+-spec worker_unavailable(pid(), #state{}) -> #state{}.
+%% Remove a gen_server_pool_proxy worker from the pool.  This function should
+%% not normally be called.
 worker_unavailable( Pid, State = #state{ available = Workers } ) ->
   State#state{ available = proplists:delete( Pid, Workers ) }.
 
 
+-spec do_work(#state{}) -> #state{}.
 do_work( State = #state{ requests  = { [], [] } } ) ->
   % No requests - do nothing.
-  {ok, State};
+  State;
 
 do_work( State = #state{ available = [],
                          requests  = { Push, [ #request{ call_args = CallArgs } | Pop ] },
@@ -302,7 +311,7 @@ do_work( State = #state{ available = [],
   case PoolSize < MaxSize of
     true  ->
       gen_server_pool_sup:add_child( SupPid ),
-      {ok, State};
+      State;
     false -> 
       % we are at max pool size, so allow queuing to occur
       case MaxTasks =/= infinity andalso NumTasks > MaxTasks of
@@ -314,12 +323,11 @@ do_work( State = #state{ available = [],
             _ -> %% cast or info.
               ok
           end,
-          { ok,
-            State#state{ requests = { Push, Pop },
-                         num_queued_tasks = NumTasks - 1,
-                         num_dropped_tasks = DroppedTasks + 1 } };
+          State#state{ requests = { Push, Pop },
+                       num_queued_tasks = NumTasks - 1,
+                       num_dropped_tasks = DroppedTasks + 1 };
         false ->
-          { ok, State }
+          State
       end
   end;
 
@@ -339,9 +347,9 @@ do_work( State = #state{ proxy_ref = ProxyRef,
         _ -> %% cast or info.
           ok
       end,
-      { ok, State#state{ available = Workers,
-                         requests  = { Push, Pop },
-                         num_queued_tasks = NumTasks - 1 } };
+      State#state{ available = Workers,
+                   requests  = { Push, Pop },
+                   num_queued_tasks = NumTasks - 1 };
     false ->
       case is_process_alive(Pid) of
         false ->
@@ -356,11 +364,10 @@ do_work( State = #state{ proxy_ref = ProxyRef,
               do_work( State#state { available = Workers } );
             false ->
               erlang:send( Pid, CallArgs, [noconnect] ),
-              {ok, State#state{ available = Workers,
-                                requests  = { Push, Pop },
-                                num_queued_tasks=NumTasks-1}
-              }
-           end
+              State#state{ available = Workers,
+                           requests  = { Push, Pop },
+                           num_queued_tasks = NumTasks - 1 }
+          end
       end
    end.
 
