@@ -339,6 +339,7 @@ do_work( State = #state{ proxy_ref = ProxyRef,
                          available = [ #worker{ pid = Pid, start_time = WorkerStartTime } | Workers ],
                          requests = Requests,
                          num_queued_tasks = NumTasks,
+                         num_dropped_tasks = DroppedTasks,
                          max_worker_age = MaxWorkerAge }) ->
   { { value, Req = #request{ call_args = CallArgs } }, RequestsOut } = queue:out( Requests ),
   case request_past_deadline(Req, State) of
@@ -349,9 +350,9 @@ do_work( State = #state{ proxy_ref = ProxyRef,
         _ -> %% cast or info.
           ok
       end,
-      State#state{ available = Workers,
-                   requests  = RequestsOut,
-                   num_queued_tasks = NumTasks - 1 };
+      do_work( State#state{ requests  = RequestsOut,
+                            num_queued_tasks = NumTasks - 1,
+                            num_dropped_tasks = DroppedTasks + 1 } );
     false ->
       case is_process_alive(Pid) of
         false ->
