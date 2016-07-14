@@ -402,12 +402,9 @@ add_children( N, #state{ sup_pid = SupPid } = S ) ->
   end.
 
 
-schedule_idle_check( #state{ idle_secs = infinity } = S ) ->
-  S;
-schedule_idle_check( #state{ proxy_ref = ProxyRef,
-                             idle_secs = IdleSecs } = S ) ->
-  erlang:send_after( IdleSecs * 1000, self(), { ProxyRef, check_idle_timeouts } ),
-  S.
+schedule_idle_check( #state{ idle_secs = infinity } ) -> ok;
+schedule_idle_check( #state{ proxy_ref = ProxyRef, idle_secs = IdleSecs } ) ->
+  erlang:send_after( IdleSecs * 1000, self(), { ProxyRef, check_idle_timeouts } ).
 
 
 check_idle_timeouts( #state{ available = [] } = S ) ->
