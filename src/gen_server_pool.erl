@@ -135,10 +135,8 @@ handle_call( {unavailable, Pid}, _From, State ) ->
   { reply, {ok, Pid}, NState };
 
 handle_call( Call, From, State ) ->
-  case handle_request ({ '$gen_call', From, Call }, State) of
-    {ok, NewState} -> { noreply, NewState };
-    {Error, NewState} -> {reply, Error, NewState}
-  end.
+  {_, NewState } = handle_request( { '$gen_call', From, Call }, State ),
+  { noreply, NewState }.
 
 %%--------------------------------------------------------------------
 %% Function: handle_cast(Msg, State) -> {noreply, State} |
@@ -292,7 +290,7 @@ do_work( State = #state{ requests  = { [], [] } } ) ->
   {ok, State};
 
 do_work( State = #state{ available = [],
-                         requests  = { Push, [ _ | Pop ] },
+                         requests  = { Push, [ #request{ call_args = CallArgs } | Pop ] },
                          max_size  = MaxSize,
                          sup_pid   = SupPid,
                          num_queued_tasks = NumTasks,
@@ -310,13 +308,16 @@ do_work( State = #state{ available = [],
       case MaxTasks =/= infinity andalso NumTasks > MaxTasks of
         true ->
           % queue too big, so drop the request
-          { {error, request_dropped },
-            State#state {
-              requests = {Push, Pop},
-              num_queued_tasks = NumTasks - 1,
-              num_dropped_tasks = DroppedTasks + 1
-            }
-          };
+          case CallArgs of
+            { '$gen_call', From, _ } ->
+              gen_server:reply( From, { error, request_dropped } );
+            _ -> %% cast or info.
+              ok
+          end,
+          { ok,
+            State#state{ requests = { Push, Pop },
+                         num_queued_tasks = NumTasks - 1,
+                         num_dropped_tasks = DroppedTasks + 1 } };
         false ->
           { ok, State }
       end
