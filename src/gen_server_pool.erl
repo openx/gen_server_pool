@@ -283,10 +283,11 @@ handle_request( Req, State = #state{ requests = Requests,
 %% Return a gen_server_pool_proxy worker to the pool.
 worker_available( Worker = #worker{ pid = Pid },
                   State = #state{ available = Workers } ) ->
-  % If a child sent a message to itself then it could already be in the list
-  case proplists:is_defined( Pid, Workers ) of
-    true  -> do_work( State );
-    false -> do_work( State#state{ available = [ Worker | Workers ] } )
+  %% Return the worker to the pool and see if there is any work queued.
+  %% If a child sent a message to itself then it could already be in the list.
+  case lists:keyfind( Pid, 1, Workers ) of
+    false -> do_work( State#state{ available = [ Worker | Workers ] } );
+    _     -> do_work( State )
   end.
 
 -spec worker_unavailable(pid(), #state{}) -> #state{}.
