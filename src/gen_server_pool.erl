@@ -203,25 +203,9 @@ code_change( _OldVsn, State, _Extra ) ->
 %%--------------------------------------------------------------------
 %%% Internal functions
 %%--------------------------------------------------------------------
-handle_request( Req, State = #state{ requests = { Push, Pop },
-                                     num_queued_tasks=NumTasks } ) ->
-  do_work( State#state{ requests = { [ timestamped_request(Req) | Push ], Pop },
-                        num_queued_tasks=NumTasks+1} ).
 
 timestamped_request(Req) ->
   #request{call_args=Req, arrival_time=os:timestamp()}.
-
-worker_available( Worker = #worker{ pid = Pid }, 
-                  State = #state{ available = Workers } ) ->
-  % If a child sent a message to itself then it could already be in the list
-  case proplists:is_defined( Pid, Workers ) of
-    true  -> do_work( State );
-    false -> do_work( State#state{ available = [ Worker | Workers ] } )
-  end.
-
-
-worker_unavailable( Pid, State = #state{ available = Workers } ) ->
-  State#state{ available = proplists:delete( Pid, Workers ) }.
 
 stats( #state{ sup_pid   = SupPid,
                available = Workers,
@@ -285,6 +269,24 @@ emit_stats( #state{ prog_id = ProgId, pool_id = PoolId } = S ) ->
 terminate_pool( _Reason, _State ) ->
   ok.
 
+
+handle_request( Req, State = #state{ requests = { Push, Pop },
+                                     num_queued_tasks = NumTasks } ) ->
+  do_work( State#state{ requests = { [ timestamped_request(Req) | Push ], Pop },
+                        num_queued_tasks = NumTasks + 1 } ).
+
+worker_available( Worker = #worker{ pid = Pid },
+                  State = #state{ available = Workers } ) ->
+  % If a child sent a message to itself then it could already be in the list
+  case proplists:is_defined( Pid, Workers ) of
+    true  -> do_work( State );
+    false -> do_work( State#state{ available = [ Worker | Workers ] } )
+  end.
+
+worker_unavailable( Pid, State = #state{ available = Workers } ) ->
+  State#state{ available = proplists:delete( Pid, Workers ) }.
+
+
 do_work( State = #state{ requests  = { [], [] } } ) ->
   % No requests - do nothing.
   {ok, State};
@@ -332,13 +334,13 @@ do_work( State = #state{ proxy_ref = ProxyRef,
     true ->
       case CallArgs of
         { '$gen_call', From, _ } ->
-          gen_server:reply(From, {error, request_timeout});
+          gen_server:reply( From, { error, request_timeout } );
         _ -> %% cast or info.
           ok
       end,
-      {ok, State#state{ available = Workers,
-                        requests  = { Push, Pop },
-                        num_queued_tasks = NumTasks - 1 }};
+      { ok, State#state{ available = Workers,
+                         requests  = { Push, Pop },
+                         num_queued_tasks = NumTasks - 1 } };
     false ->
       case is_process_alive(Pid) of
         false ->
