@@ -33,6 +33,9 @@ handle_call( { delay_task, Millis }, _From, State ) ->
 handle_call( {echo, Msg}, _From, State ) ->
   { reply, Msg, State }.
 
+handle_cast( {send_message, To, Msg}, State ) ->
+  To ! Msg,
+  { noreply, State };
 handle_cast( Msg, State ) ->
   error_logger:info_msg("~s:~B - ~s:handle_cast/2 - unknown message, Msg:[~p]~n",
                 [?FILE,?LINE,?MODULE,Msg]),
@@ -75,6 +78,17 @@ max_worker_wait_test () ->
   %% Test basic functionality.
   Msg1 = <<"test one">>,
   ?assertEqual( Msg1, gen_server:call( PoolId, { echo, Msg1 } ) ),
+
+  %% Test cast.
+  MsgCast = <<"test cast">>,
+  ?assertEqual( ok, gen_server:cast( PoolId, { send_message, self(), MsgCast } ) ),
+  CastResponse =
+  receive
+    CastMsg -> CastMsg
+  after
+    100 -> timeout
+  end,
+  ?assertEqual( MsgCast, CastResponse ),
 
   SpawnTasks =
     fun ( Count ) ->
