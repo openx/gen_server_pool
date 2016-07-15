@@ -1,15 +1,18 @@
 REBAR:=rebar
 
-.PHONY: all erl test clean doc 
+.PHONY: all erl test clean doc check
 
 all: erl
 
 erl:
 	$(REBAR) get-deps compile
 
-test: all
+check test: all
 	@mkdir -p .eunit
 	$(REBAR) skip_deps=true eunit
+
+dialyzer: all
+	dialyzer ebin
 
 clean:
 	$(REBAR) clean
