@@ -27,13 +27,13 @@ init( [] ) ->
   process_flag( trap_exit, true ),
   {ok, {}}.
 
-handle_call( { delay_task, Millis }, _From, State ) ->
-  timer:sleep( Millis ),
-  { reply, ok, State };
-handle_call( {echo, Msg}, _From, State ) ->
+handle_call( { delay_task, MS, N }, _From, State ) ->
+  timer:sleep( MS ),
+  { reply, N, State };
+handle_call( { echo, Msg }, _From, State ) ->
   { reply, Msg, State }.
 
-handle_cast( {send_message, To, Msg}, State ) ->
+handle_cast( { send_message, To, Msg }, State ) ->
   To ! Msg,
   { noreply, State };
 handle_cast( Msg, State ) ->
@@ -46,11 +46,10 @@ handle_info( _Info, State ) ->
 
 terminate( Reason, _State ) ->
   case Reason of
-    normal   -> ok;
     shutdown -> ok;
-    _Else     ->
-      error_logger:info_msg("~s:~B - ~s:terminate/2 - reason ~w~n",
-                    [?FILE,?LINE,?MODULE,Reason]),
+    _ ->
+      error_logger:info_msg( "~s:~B - ~s:terminate/2 - reason ~w\n",
+                             [ ?FILE, ?LINE, ?MODULE, Reason ] ),
       ok
   end.
 
@@ -92,18 +91,23 @@ max_worker_wait_test () ->
 
   SpawnTasks =
     fun ( Count ) ->
-        timer:sleep( 5 ),
         lists:foreach(
-          fun (_) -> spawn( fun () -> gen_server:call( PoolId, { delay_task, 200 } ) end ) end,
-          lists:seq( 1, Count ) ),
-        timer:sleep( 5 )
+          fun ( N ) -> spawn( fun () ->
+                                  case gen_server:call( PoolId, { delay_task, 200, N } ) of
+                                    N -> %% io:format( standard_error, "got ~p\n", [ N ] ),
+                                         ok;
+                                    R -> io:format( standard_error, "unexpected response ~p for ~p\n", [ R, N ] )
+                                  end
+                              end ),
+                       timer:sleep( 1 )
+          end, lists:seq( 1, Count ) )
     end,
 
   %% Test request_timeout.
   %% This request will time out.  It will be queued, but by the time it is
   %% removed from the queue request_max_wait will have been exceeded.
   SpawnTasks( MaxPoolSize ),
-  Result = gen_server:call( PoolId, { delay_task, 100 } ),
+  Result = gen_server:call( PoolId, { delay_task, 100, 99 } ),
   ?assertEqual( { error, request_timeout }, Result ),
 
   %% Test request_dropped.  Spawn one request.  This will sit in the
@@ -113,18 +117,24 @@ max_worker_wait_test () ->
   Parent = self(),
   Msg2 = <<"test two">>,
   Pid2 = spawn( fun () -> Parent ! { self(), gen_server:call( PoolId, { echo, Msg2 } ) } end ),
-  SpawnTasks(MaxQueue),
+  timer:sleep( 1 ),
+  SpawnTasks( MaxQueue ),
 
   Result2 =
     receive
       { Pid2, Result2A } -> Result2A
     end,
+  %% timer:sleep( 200 ),
   ?assertEqual( { error, request_dropped }, Result2 ),
 
-  timer:sleep(200),
+  timer:sleep( 200 ),
 
   %% This request should succeed.
   Msg3 = <<"test three">>,
-  ?assertEqual( Msg3, gen_server:call( PoolId, { echo, Msg3 } ) ).
+  ?assertEqual( Msg3, gen_server:call( PoolId, { echo, Msg3 } ) ),
+
+  gen_server:cast( PoolId, stop ),
+
+  ok.
 
 -endif. %% TEST

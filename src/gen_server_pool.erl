@@ -27,7 +27,6 @@
           terminate/2,
           code_change/3 ]).
 
--define(EMPTY_QUEUE, {[], []}).                 % Define empty queue for pattern matching.
 -define(M, 1000000).
 
 -record(worker, { pid :: pid(),
@@ -42,7 +41,7 @@
                  sup_max_r,
                  sup_max_t = 1,
                  available = [] :: list( #worker{} ),
-                 requests  = queue:new(),
+                 requests  = queue:new() :: queue:queue( #request{} ),
                  min_size  = 0,
                  max_size  = 10,
                  idle_secs = infinity,
@@ -149,7 +148,10 @@ handle_call( Call, From, State ) ->
 handle_cast( { ProxyRef, worker_available, Worker=#worker{} },
              State = #state{ proxy_ref = ProxyRef } ) ->
   NewState = worker_available( Worker, State ),
-  {noreply, NewState};
+  { noreply, NewState };
+
+handle_cast( stop, State ) ->
+  { stop, normal, State };
 
 handle_cast( Cast, State ) ->
   NewState = handle_request( { '$gen_cast', Cast }, State ),
@@ -175,8 +177,9 @@ handle_info( { ProxyRef, collect_stats },
 
 handle_info( { ProxyRef, check_idle_timeouts },
              #state{ proxy_ref = ProxyRef } = State ) ->
+  NewState = check_idle_timeouts( State ),
   schedule_idle_check( State ),
-  { noreply, check_idle_timeouts( State ) }; 
+  { noreply, NewState };
 
 handle_info( Info, State ) ->
   NewState = handle_request( Info, State ),
@@ -273,21 +276,18 @@ terminate_pool( _Reason, _State ) ->
 -spec handle_request(term(), #state{}) -> #state{}.
 %% Handle a gen_server call, cast, or info request by proxying it to a
 %% gen_server_pool_proxy worker.
-handle_request( Req, State = #state{ requests = Requests,
-                                     num_queued_tasks = NumTasks } ) ->
-  do_work( State#state{ requests = queue:in( timestamped_request(Req), Requests ),
-                        num_queued_tasks = NumTasks + 1 } ).
+handle_request( Request, State ) ->
+  State1 = check_for_worker( State ),
+  State2 = time_out_requests( State1 ),
+  State3 = enqueue_request( State2, Request ),
+  do_work( State3 ).
 
 -spec worker_available(#worker{}, #state{}) -> #state{}.
 %% Return a gen_server_pool_proxy worker to the pool.
-worker_available( Worker = #worker{ pid = Pid },
-                  State = #state{ available = Workers } ) ->
-  %% Return the worker to the pool and see if there is any work queued.
-  %% If a child sent a message to itself then it could already be in the list.
-  case lists:keyfind( Pid, #worker.pid, Workers ) of
-    false -> do_work( State#state{ available = [ Worker | Workers ] } );
-    _     -> do_work( State )
-  end.
+worker_available( Worker, State ) ->
+  State1 = return_worker_to_pool( State, Worker ),
+  State2 = time_out_requests( State1 ),
+  do_work( State2 ).
 
 -spec worker_unavailable(pid(), #state{}) -> #state{}.
 %% Remove a gen_server_pool_proxy worker from the pool.  This function should
@@ -297,98 +297,32 @@ worker_unavailable( Pid, State = #state{ available = Workers } ) ->
 
 
 -spec do_work(#state{}) -> #state{}.
-do_work( State = #state{ requests = ?EMPTY_QUEUE } ) ->
-  %% No requests - do nothing.
+do_work( State = #state{ num_queued_tasks = 0 } ) ->
+  %% No requests -- do nothing.
   State;
 
-do_work( State = #state{ available = [],
-                         requests = Requests,
-                         max_size  = MaxSize,
-                         sup_pid   = SupPid,
-                         num_queued_tasks = NumTasks,
-                         num_dropped_tasks = DroppedTasks,
-                         max_queued_tasks = MaxTasks
-                 } ) ->
-  %% Requests, but no workers - check if we can start a worker.
-  PoolSize = proplists:get_value( active, supervisor:count_children( SupPid ) ),
-  case PoolSize < MaxSize of
-    true  ->
-      gen_server_pool_sup:add_child( SupPid ),
-      State;
-    false -> 
-      %% We are at max pool size, so allow queuing to occur.
-      case MaxTasks =/= infinity andalso NumTasks > MaxTasks of
-        true ->
-          %% Queue too big, so drop the oldest request.
-          { { value, #request{ call_args = CallArgs } }, RequestsOut } = queue:out( Requests ),
-          case CallArgs of
-            { '$gen_call', From, _ } ->
-              gen_server:reply( From, { error, request_dropped } );
-            _ -> %% cast or info.
-              ok
-          end,
-          State#state{ requests = RequestsOut,
-                       num_queued_tasks = NumTasks - 1,
-                       num_dropped_tasks = DroppedTasks + 1 };
-        false ->
-          State
-      end
-  end;
+do_work( State = #state{ available = [] } ) ->
+  %% No workers -- do nothing.
+  State;
 
-do_work( State = #state{ proxy_ref = ProxyRef,
-                         available = [ #worker{ pid = Pid, start_time = WorkerStartTime } | Workers ],
+do_work( State = #state{ available = [ #worker{ pid = Pid } | Workers ],
                          requests = Requests,
-                         num_queued_tasks = NumTasks,
-                         num_dropped_tasks = DroppedTasks,
-                         max_worker_age = MaxWorkerAge }) ->
-  { { value, Req = #request{ call_args = CallArgs } }, RequestsOut } = queue:out( Requests ),
-  case request_past_deadline(Req, State) of
-    true ->
-      case CallArgs of
-        { '$gen_call', From, _ } ->
-          gen_server:reply( From, { error, request_timeout } );
-        _ -> %% cast or info.
-          ok
-      end,
-      do_work( State#state{ requests  = RequestsOut,
-                            num_queued_tasks = NumTasks - 1,
-                            num_dropped_tasks = DroppedTasks + 1 } );
+                         num_queued_tasks = NumQueuedRequests } ) ->
+  { { value, #request{ call_args = CallArgs } }, RequestsOut } = queue:out( Requests ),
+  case is_process_alive( Pid ) of
     false ->
-      case is_process_alive(Pid) of
-        false ->
-          do_work( State#state{ available = Workers } );
-        true  ->
-          %% Check worker age here, and boot it if too old
-          case worker_too_old(WorkerStartTime, MaxWorkerAge) of
-            true ->
-              % Kill the old worker, and check the min pool size
-              gen_server_pool_proxy:stop( Pid, ProxyRef ),
-              assure_min_pool_size( State ),
-              do_work( State#state { available = Workers } );
-            false ->
-              erlang:send( Pid, CallArgs, [noconnect] ),
-              State#state{ available = Workers,
-                           requests  = RequestsOut,
-                           num_queued_tasks = NumTasks - 1 }
-          end
-      end
-   end.
+      %% The first worker in the available stack may have died between when it
+      %% was checked in check_for_worker and now.
+      do_work( State#state{ available = Workers } );
+    true  ->
+      erlang:send( Pid, CallArgs, [noconnect] ),
+      State#state{ available = Workers,
+                   requests  = RequestsOut,
+                   num_queued_tasks = NumQueuedRequests - 1 }
+  end.
 
 
-request_past_deadline( _, #state{max_worker_wait=infinity} ) -> false;
-request_past_deadline( #request{arrival_time=BeginTime},
-    #state{max_worker_wait=MaxTimeInMillis} ) ->
-  ElapsedTime=(timer:now_diff(os:timestamp(), BeginTime) / 1000),
-  ElapsedTime >= MaxTimeInMillis.
-
-worker_too_old (_WorkerStartTime, infinity) ->
-  false;
-worker_too_old (WorkerStartTime, MaxWorkerAge) ->
-  Now = os:timestamp(),
-  WorkerAge = seconds_between( Now, WorkerStartTime ),
-  WorkerAge >= MaxWorkerAge.
-
-assure_min_pool_size( #state{ min_size = MinSize, sup_pid = SupPid } = S ) ->
+ensure_min_pool_size( #state{ min_size = MinSize, sup_pid = SupPid } = S ) ->
   PoolSize = proplists:get_value( active, supervisor:count_children( SupPid ) ),
   add_children( MinSize - PoolSize, S ).
 
@@ -430,20 +364,132 @@ check_idle_timeouts( #state{ proxy_ref = ProxyRef,
   Survivors = kill_idle_workers( ProxyRef, MaxIdleTimeKill, Survivors0, [], MaxWorkersToKill ),
 
   State = S#state{ available = Survivors },
-  assure_min_pool_size( State ),
+  ensure_min_pool_size( State ),
 
   State.
+
+
+%% Checks the worker pool for an available worker.  If none is found, and the
+%% total number of workers is less than the maximum, starts a new worker.
+%% Returns the updated state.
+check_for_worker( State = #state{ available = Available } ) ->
+  AgedWorkerKillTime = aged_worker_kill_time( State ),
+  AvailableOut = check_for_worker_do( State, AgedWorkerKillTime, Available ),
+  State#state{ available = AvailableOut }.
+
+check_for_worker_do( State = #state{ proxy_ref = ProxyRef }, AgedWorkerKillTime,
+                     Available = [ Worker = #worker{ pid = Pid } | RemainingWorkers ] ) ->
+  case is_process_alive( Pid ) of
+    false     ->
+      %% Worker is dead; drop it and try again.
+      check_for_worker_do( State, AgedWorkerKillTime, RemainingWorkers );
+    true ->
+      case worker_too_old( Worker, AgedWorkerKillTime ) of
+        true ->
+          %% Worker is alive, but too old; kill it and try again.
+          gen_server_pool_proxy:stop( Pid, ProxyRef ),
+          check_for_worker_do( State, AgedWorkerKillTime, RemainingWorkers );
+        false ->
+          %% Worker is alive and not too old; return.
+          Available
+      end
+  end;
+check_for_worker_do( #state{ sup_pid = SupPid, max_size = MaxSize }, _AgedWorkerKillTime, [] ) ->
+  %% No workers are available.  If the total number of workers is less than
+  %% the maximum, start a new one.
+  PoolSize = proplists:get_value( active, supervisor:count_children( SupPid ) ),
+  %% If PoolSize is less than MinSize we should start enough workers to bring
+  %% it up, but currently the add_child call is synchronous and we don't want
+  %% to block the current request.
+  PoolSize < MaxSize andalso
+    gen_server_pool_sup:add_child( SupPid ),
+  [].
+
+
+%% Returns a worker to the pool, unless it is too old, in which case it is
+%% killed.
+return_worker_to_pool( State = #state{ proxy_ref = ProxyRef, available = Available }, Worker = #worker{ pid = Pid } ) ->
+  AgedWorkerKillTime = aged_worker_kill_time( State ),
+  case worker_too_old( Worker, AgedWorkerKillTime ) of
+    true ->
+      %% The worker is too old; kill it.
+      gen_server_pool_proxy:stop( Pid, ProxyRef ),
+      %% It would be better to use an asynchronous call to ensure
+      %% the pool size.
+      ensure_min_pool_size( State ),
+      State;
+    false ->
+      %% If a child sent a message to itself then it could already be in the list.
+      case lists:keyfind( Pid, #worker.pid, Available ) of
+        false -> State#state{ available = [ Worker | Available ] };
+        _     -> State
+      end
+  end.
+
+
+time_out_requests( State = #state{ requests = Requests,
+                                   num_queued_tasks = NumQueuedRequests,
+                                   num_dropped_tasks = NumDroppedRequests } ) ->
+  RequestTimeoutTime = request_timeout_time( State ),
+  { Requests1, NumQueuedRequests1, NumDroppedRequests1 } =
+    time_out_requests_do( Requests, NumQueuedRequests, NumDroppedRequests, RequestTimeoutTime ),
+  State#state{ requests = Requests1, num_queued_tasks = NumQueuedRequests1, num_dropped_tasks = NumDroppedRequests1 }.
+
+time_out_requests_do( Requests, NumQueuedRequests, NumDroppedRequests, RequestTimeoutTime ) ->
+  case queue:peek( Requests ) of
+    empty ->
+      { Requests, NumQueuedRequests, NumDroppedRequests };
+    { value, Request = #request{ call_args = CallArgs } } ->
+      case request_too_old( Request, RequestTimeoutTime ) of
+        true ->
+          case CallArgs of
+            { '$gen_call', From, _ } ->
+              gen_server:reply( From, { error, request_timeout } );
+            _ -> %% cast or info.
+              ok
+          end,
+          time_out_requests_do( queue:drop( Requests ), NumQueuedRequests - 1, NumDroppedRequests + 1, RequestTimeoutTime );
+        false -> { Requests, NumQueuedRequests, NumDroppedRequests }
+      end
+  end.
+
+
+enqueue_request( State = #state{ requests = Requests,
+                                 max_queued_tasks = MaxQueuedRequests,
+                                 num_queued_tasks = NumQueuedRequests,
+                                 num_dropped_tasks = NumDroppedRequests },
+                 Request ) ->
+
+
+  { Requests2, NumQueuedRequests2, NumDroppedRequests2 } =
+    if NumQueuedRequests =:= 0 orelse NumQueuedRequests < MaxQueuedRequests ->
+        { Requests, NumQueuedRequests, NumDroppedRequests };
+       true ->
+        { { value, #request{ call_args = CallArgs } }, Requests1 } = queue:out( Requests ),
+        case CallArgs of
+          { '$gen_call', From, _ } ->
+            gen_server:reply( From, { error, request_dropped } );
+          _ -> %% cast or info.
+            ok
+        end,
+        { Requests1, NumQueuedRequests - 1, NumDroppedRequests + 1 }
+    end,
+  State#state{ requests = queue:in( timestamped_request( Request ), Requests2 ),
+               num_queued_tasks = NumQueuedRequests2 + 1,
+               num_dropped_tasks = NumDroppedRequests2 }.
+
+
 
 %% Enforce max_worker_age and prune the worker list of dead processes.  This
 %% function reverses the order of the worker list; it will be reversed again
 %% by kill_idle_workers.  maintaining the order of the worker list.
 kill_aged_workers( _ProxyRef, _TimeKill, [], Survivors ) ->
   Survivors;
-kill_aged_workers( ProxyRef, TimeKill, [ Worker = #worker{ pid = Pid, start_time = StartTime } | Available ], Survivors ) ->
+kill_aged_workers( ProxyRef, TimeKill, [ Worker = #worker{ pid = Pid } | Available ], Survivors ) ->
   case is_process_alive( Pid ) of
     false     -> kill_aged_workers( ProxyRef, TimeKill, Available, Survivors );                 % Worker is dead; drop it.
     true ->
-      case TimeKill =/= undefined andalso timer:now_diff( TimeKill, StartTime ) > 0 of
+      case worker_too_old( Worker, TimeKill ) of
         true  -> gen_server_pool_proxy:stop( Pid, ProxyRef ),                                   % Worker is alive, but too old; kill it.
                  kill_aged_workers( ProxyRef, TimeKill, Available, Survivors );
         false -> kill_aged_workers( ProxyRef, TimeKill, Available, [ Worker | Survivors ] )     % Worker is alive and not too old; keep it.
@@ -474,6 +520,30 @@ kill_idle_workers( ProxyRef, TimeKill, [ Worker = #worker{ pid = Pid, available_
   end.
 
 
+aged_worker_kill_time( #state{ max_worker_age = infinity } ) ->
+  undefined;
+aged_worker_kill_time( #state{ max_worker_age = MaxWorkerAge } ) ->
+  now_sub( os:timestamp(), MaxWorkerAge * ?M ).
+
+
+request_timeout_time( #state{ max_worker_wait = infinity } ) ->
+  undefined;
+request_timeout_time( #state{ max_worker_wait = MaxWorkerWait } ) ->
+  now_sub( os:timestamp(), MaxWorkerWait * 1000 ).
+
+
+worker_too_old( _Worker, undefined ) ->
+  false;
+worker_too_old( #worker{ start_time = StartTime }, AgedWorkerKillTime ) ->
+  timer:now_diff( AgedWorkerKillTime, StartTime ) > 0.
+
+
+request_too_old( _Request, undefined ) ->
+  false;
+request_too_old( #request{ arrival_time = ArrivalTime }, RequestTimeoutTime ) ->
+  timer:now_diff( RequestTimeoutTime, ArrivalTime ) > 0.
+
+
 now_sub( { Megas, Secs, Micros }, SubMicros ) ->
   SubMicros0 = SubMicros rem ?M,
   SubSecs0 = SubMicros div ?M,
@@ -490,12 +560,6 @@ now_sub( { Megas, Secs, Micros }, SubMicros ) ->
       SecsOut0                    -> {SecsOut0 + ?M, SubMegas2 + 1}
     end,
   {Megas - SubMegas3, SecsOut, MicrosOut}.
-
-
-seconds_between( { MS1, S1, _ }, { MS1, S2, _ } ) ->
-  S1 - S2;
-seconds_between( { MS1, S1, _ }, { MS2, S2, _ } ) ->
-  ( MS1 * 1000000 + S1 ) - ( MS2 * 1000000 + S2 ).
 
 
 schedule_emit_stats( #state{ prog_id = undefined } ) ->
@@ -560,7 +624,7 @@ setup_schedule( State, PoolOpts ) ->
   end,
 
   % start min_pool_size workers and schedule idle time check
-  case assure_min_pool_size( State ) of
+  case ensure_min_pool_size( State ) of
     ok ->
       schedule_idle_check( State ),
       { ok, State };
