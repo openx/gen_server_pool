@@ -34,12 +34,12 @@
         { 'prog_id', atom() | string() } |
         { 'min_pool_size', non_neg_integer() } |
         { 'max_pool_size', pos_integer() } |
-        { 'idle_timeout', pos_integer() | 'infinity' } |
-        { 'max_queue', non_neg_integer() } |
-        { 'max_worker_age', pos_integer() | 'infinity' } |
+        { 'max_worker_age_ms', pos_integer() | 'infinity' } |
+        { 'max_worker_idle_ms', pos_integer() | 'infinity' } |
+        { 'max_queued_requests', non_neg_integer() } |
+        { 'max_request_wait_ms', pos_integer() | 'infinity' } |
         { 'sup_max_r', non_neg_integer() } |
         { 'sup_max_t', pos_integer() } |
-        { 'request_max_wait', pos_integer() | 'infinity' } |
         { 'mondemand', term() }.
 -type options() :: list( option() ).
 
@@ -58,8 +58,10 @@
                  requests  = queue:new() :: queue:queue( #request{} ),
                  min_pool_size  = 0 :: non_neg_integer(),
                  max_pool_size  = 10 :: pos_integer(),
-                 idle_secs = infinity,
+                 max_worker_age_ms = infinity,
+                 max_worker_idle_ms = infinity,
                  max_queued_requests = infinity,
+                 max_request_wait_ms = infinity,
                  num_queued_requests = 0,
                  num_dropped_requests = 0,
                  module :: atom(),
@@ -67,10 +69,7 @@
                  prog_id,
                  wm_size = 0,
                  wm_active = 0,
-                 wm_requests = 0,
-                 max_worker_age = infinity,
-                 max_worker_wait = infinity
-                 }).
+                 wm_requests = 0 }).
 
 %%====================================================================
 %% API
@@ -348,31 +347,24 @@ add_children( N, #state{ sup_pid = SupPid } = S ) ->
   end.
 
 
-schedule_idle_check( #state{ idle_secs = infinity } ) -> ok;
-schedule_idle_check( #state{ proxy_ref = ProxyRef, idle_secs = IdleSecs } ) ->
-  erlang:send_after( IdleSecs * 1000, self(), { ProxyRef, check_idle_timeouts } ).
+schedule_idle_check( #state{ max_worker_idle_ms = infinity } ) -> ok;
+schedule_idle_check( #state{ proxy_ref = ProxyRef, max_worker_idle_ms = MaxWorkerIdleMS } ) ->
+  erlang:send_after( MaxWorkerIdleMS, self(), { ProxyRef, check_idle_timeouts } ).
 
 
 check_idle_timeouts( #state{ available = [] } = S ) ->
   S;
 check_idle_timeouts( #state{ proxy_ref = ProxyRef,
                              sup_pid = SupPid,
-                             idle_secs = IdleSecs,
+                             max_worker_idle_ms = MaxWorkerIdleMS,
                              available = Available,
-                             min_pool_size = MinPoolSize,
-                             max_worker_age = MaxWorkerAge } = S ) ->
-  Now = os:timestamp(),
-
-  MaxAgeTimeKill =
-    case MaxWorkerAge of
-      infinity -> undefined;
-      _        -> now_sub( Now, MaxWorkerAge * ?M )
-    end,
+                             min_pool_size = MinPoolSize } = S ) ->
+  MaxAgeTimeKill = aged_worker_kill_time( S ),
   Survivors0 = kill_aged_workers( ProxyRef, MaxAgeTimeKill, Available, [] ),
 
   PoolSize = proplists:get_value( active, supervisor:count_children( SupPid ) ),
   MaxWorkersToKill = PoolSize - MinPoolSize,
-  MaxIdleTimeKill = now_sub( os:timestamp(), IdleSecs * ?M ),
+  MaxIdleTimeKill = now_sub( os:timestamp(), MaxWorkerIdleMS * 1000 ),
   Survivors = kill_idle_workers( ProxyRef, MaxIdleTimeKill, Survivors0, [], MaxWorkersToKill ),
 
   State = S#state{ available = Survivors },
@@ -532,16 +524,16 @@ kill_idle_workers( ProxyRef, TimeKill, [ Worker = #worker{ pid = Pid, available_
   end.
 
 
-aged_worker_kill_time( #state{ max_worker_age = infinity } ) ->
+aged_worker_kill_time( #state{ max_worker_age_ms = infinity } ) ->
   undefined;
-aged_worker_kill_time( #state{ max_worker_age = MaxWorkerAge } ) ->
-  now_sub( os:timestamp(), MaxWorkerAge * ?M ).
+aged_worker_kill_time( #state{ max_worker_age_ms = MaxWorkerAgeMS } ) ->
+  now_sub( os:timestamp(), MaxWorkerAgeMS * 1000 ).
 
 
-request_timeout_time( #state{ max_worker_wait = infinity } ) ->
+request_timeout_time( #state{ max_request_wait_ms = infinity } ) ->
   undefined;
-request_timeout_time( #state{ max_worker_wait = MaxWorkerWait } ) ->
-  now_sub( os:timestamp(), MaxWorkerWait * 1000 ).
+request_timeout_time( #state{ max_request_wait_ms = MaxRequestWaitMS } ) ->
+  now_sub( os:timestamp(), MaxRequestWaitMS * 1000 ).
 
 
 worker_too_old( _Worker, undefined ) ->
@@ -601,21 +593,31 @@ parse_opts( [ { min_pool_size, V } | Opts ], State ) when is_integer(V), V >= 0 
   parse_opts( Opts, State#state{ min_pool_size = V } );
 parse_opts( [ { max_pool_size, V } | Opts ], State ) when is_integer(V), V >= 1 ->
   parse_opts( Opts, State#state{ max_pool_size = V } );
-parse_opts( [ { idle_timeout, V } | Opts ], State ) when is_integer(V), V >= 1; V =:= 'infinity' ->
-  parse_opts( Opts, State#state{ idle_secs = V } );
-parse_opts( [ { max_queue, V } | Opts ], State ) when is_integer(V), V >= 0; V =:= 'infinity' ->
+parse_opts( [ { max_worker_age_ms, V } | Opts ], State ) when is_integer(V), V >= 1; V =:= 'infinity' ->
+  parse_opts( Opts, State#state{ max_worker_age_ms = V } );
+parse_opts( [ { max_worker_idle_ms, V } | Opts ], State ) when is_integer(V), V >= 1; V =:= 'infinity' ->
+  parse_opts( Opts, State#state{ max_worker_idle_ms = V } );
+parse_opts( [ { max_queued_requests, V } | Opts ], State ) when is_integer(V), V >= 0; V =:= 'infinity' ->
   parse_opts( Opts, State#state{ max_queued_requests = V } );
-parse_opts( [ { max_worker_age, V } | Opts ], State ) when is_integer(V), V >= 1; V =:= 'infinity' ->
-  parse_opts( Opts, State#state{ max_worker_age = V } );
+parse_opts( [ { max_request_wait_ms, V } | Opts ], State ) when is_integer(V), V >= 1; V =:= 'infinity' ->
+  parse_opts( Opts, State#state{ max_request_wait_ms = V } );
 parse_opts( [ { sup_max_r, V } | Opts ], State ) when is_integer(V), V >= 0 ->
   parse_opts( Opts, State#state{ sup_max_r = V } );
 parse_opts( [ { sup_max_t, V } | Opts ], State ) when is_integer(V), V >= 1 ->
   parse_opts( Opts, State#state{ sup_max_t = V } );
-parse_opts( [ { request_max_wait, V } | Opts ], State ) when is_integer(V), V >= 1; V =:= 'infinity' ->
-  parse_opts( Opts, State#state{ max_worker_wait = V } );
 parse_opts( [ { mondemand, _ } | Opts ], State ) ->
   % stats option is not set in state
-  parse_opts( Opts, State ).
+  parse_opts( Opts, State );
+%% Deprecated options names.
+parse_opts( [ { max_queue, V } | Opts ], State ) when is_integer(V), V >= 0; V =:= 'infinity' ->
+  parse_opts( Opts, State#state{ max_queued_requests = V } );
+parse_opts( [ { idle_timeout, V } | Opts ], State ) when is_integer(V), V >= 1; V =:= 'infinity' ->
+  parse_opts( Opts, State#state{ max_worker_idle_ms = V * 1000 } );
+parse_opts( [ { max_worker_age, V } | Opts ], State ) when is_integer(V), V >= 1; V =:= 'infinity' ->
+  parse_opts( Opts, State#state{ max_worker_age_ms = V  * 1000 } );
+parse_opts( [ { request_max_wait, V } | Opts ], State ) when is_integer(V), V >= 1; V =:= 'infinity' ->
+  parse_opts( Opts, State#state{ max_request_wait_ms = V } ).
+
 
 
 finalize( #state{ sup_max_r = undefined, max_pool_size = Sz } = S ) ->
