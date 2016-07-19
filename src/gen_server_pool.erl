@@ -45,15 +45,15 @@
                  min_size  = 0,
                  max_size  = 10,
                  idle_secs = infinity,
-                 max_queued_tasks = infinity,
-                 num_queued_tasks = 0,
-                 num_dropped_tasks = 0,
+                 max_queued_requests = infinity,
+                 num_queued_requests = 0,
+                 num_dropped_requests = 0,
                  module,
                  pool_id,
                  prog_id,
                  wm_size = 0,
                  wm_active = 0,
-                 wm_tasks = 0,
+                 wm_requests = 0,
                  max_worker_age = infinity,
                  max_worker_wait = infinity
                  }).
@@ -214,9 +214,9 @@ stats( #state{ sup_pid   = SupPid,
                available = Workers,
                wm_size = WmSize, 
                wm_active = WmActive, 
-               wm_tasks = WmTasks,
-               num_queued_tasks = NumTasks,
-               num_dropped_tasks = NumDroppedTasks
+               wm_requests = WmRequests,
+               num_queued_requests = NumQueuedRequests,
+               num_dropped_requests = NumDroppedRequests
                } ) ->
   Size   = proplists:get_value( active, supervisor:count_children( SupPid ) ),
   Idle   = length( Workers ),
@@ -225,29 +225,28 @@ stats( #state{ sup_pid   = SupPid,
   [ { size, Size },
     { active, Active },
     { idle, Idle },
-    { tasks, NumTasks },
-    { wmsize, WmSize},
-    { wmactive, WmActive},
-    { wmidle, WmIdle},
-    { wmtasks, WmTasks},
-    { drops, NumDroppedTasks}
+    { tasks, NumQueuedRequests },
+    { wmsize, WmSize },
+    { wmactive, WmActive },
+    { wmidle, WmIdle },
+    { wmtasks, WmRequests },
+    { drops, NumDroppedRequests }
   ].
 
 collect_stats ( State = #state{ sup_pid = SupPid,
                                 available = Workers,
-                                wm_size = WmSize, wm_active = WmActive, 
-                                wm_tasks = WmTasks,
-                                num_queued_tasks=NumTasks } ) ->
+                                num_queued_requests = NumQueuedRequests,
+                                wm_size = WmSize,
+                                wm_active = WmActive,
+                                wm_requests = WmRequests } ) ->
   Size   = proplists:get_value( active, supervisor:count_children( SupPid ) ),
   Idle   = length( Workers ),
   Active = Size - Idle,
-  Tasks  = NumTasks,
 
-  NewWmSize = max (Size,WmSize),
-  NewWmActive = max (Active, WmActive),
-  NewWmTasks = max (Tasks, WmTasks),
-
-  State#state{wm_size = NewWmSize, wm_active = NewWmActive, wm_tasks = NewWmTasks}.
+  State#state{
+    wm_size = max( Size, WmSize ),
+    wm_active = max( Active, WmActive ),
+    wm_requests = max( NumQueuedRequests, WmRequests ) }.
 
 emit_stats( #state{ prog_id = ProgId, pool_id = PoolId } = S ) ->
   N = fun( K ) -> 
@@ -265,9 +264,8 @@ emit_stats( #state{ prog_id = ProgId, pool_id = PoolId } = S ) ->
   S#state{
      wm_size = 0,
      wm_active = 0,
-     wm_tasks = 0,
-     num_dropped_tasks=0
-  }.
+     wm_requests = 0,
+     num_dropped_requests = 0 }.
 
 terminate_pool( _Reason, _State ) ->
   ok.
@@ -297,7 +295,7 @@ worker_unavailable( Pid, State = #state{ available = Workers } ) ->
 
 
 -spec do_work(#state{}) -> #state{}.
-do_work( State = #state{ num_queued_tasks = 0 } ) ->
+do_work( State = #state{ num_queued_requests = 0 } ) ->
   %% No requests -- do nothing.
   State;
 
@@ -307,7 +305,7 @@ do_work( State = #state{ available = [] } ) ->
 
 do_work( State = #state{ available = [ #worker{ pid = Pid } | Workers ],
                          requests = Requests,
-                         num_queued_tasks = NumQueuedRequests } ) ->
+                         num_queued_requests = NumQueuedRequests } ) ->
   { { value, #request{ call_args = CallArgs } }, RequestsOut } = queue:out( Requests ),
   case is_process_alive( Pid ) of
     false ->
@@ -318,7 +316,7 @@ do_work( State = #state{ available = [ #worker{ pid = Pid } | Workers ],
       erlang:send( Pid, CallArgs, [noconnect] ),
       State#state{ available = Workers,
                    requests  = RequestsOut,
-                   num_queued_tasks = NumQueuedRequests - 1 }
+                   num_queued_requests = NumQueuedRequests - 1 }
   end.
 
 
@@ -428,12 +426,12 @@ return_worker_to_pool( State = #state{ proxy_ref = ProxyRef, available = Availab
 
 
 time_out_requests( State = #state{ requests = Requests,
-                                   num_queued_tasks = NumQueuedRequests,
-                                   num_dropped_tasks = NumDroppedRequests } ) ->
+                                   num_queued_requests = NumQueuedRequests,
+                                   num_dropped_requests = NumDroppedRequests } ) ->
   RequestTimeoutTime = request_timeout_time( State ),
   { Requests1, NumQueuedRequests1, NumDroppedRequests1 } =
     time_out_requests_do( Requests, NumQueuedRequests, NumDroppedRequests, RequestTimeoutTime ),
-  State#state{ requests = Requests1, num_queued_tasks = NumQueuedRequests1, num_dropped_tasks = NumDroppedRequests1 }.
+  State#state{ requests = Requests1, num_queued_requests = NumQueuedRequests1, num_dropped_requests = NumDroppedRequests1 }.
 
 time_out_requests_do( Requests, NumQueuedRequests, NumDroppedRequests, RequestTimeoutTime ) ->
   case queue:peek( Requests ) of
@@ -455,9 +453,9 @@ time_out_requests_do( Requests, NumQueuedRequests, NumDroppedRequests, RequestTi
 
 
 enqueue_request( State = #state{ requests = Requests,
-                                 max_queued_tasks = MaxQueuedRequests,
-                                 num_queued_tasks = NumQueuedRequests,
-                                 num_dropped_tasks = NumDroppedRequests },
+                                 max_queued_requests = MaxQueuedRequests,
+                                 num_queued_requests = NumQueuedRequests,
+                                 num_dropped_requests = NumDroppedRequests },
                  Request ) ->
 
 
@@ -475,8 +473,8 @@ enqueue_request( State = #state{ requests = Requests,
         { Requests1, NumQueuedRequests - 1, NumDroppedRequests + 1 }
     end,
   State#state{ requests = queue:in( timestamped_request( Request ), Requests2 ),
-               num_queued_tasks = NumQueuedRequests2 + 1,
-               num_dropped_tasks = NumDroppedRequests2 }.
+               num_queued_requests = NumQueuedRequests2 + 1,
+               num_dropped_requests = NumDroppedRequests2 }.
 
 
 
@@ -591,7 +589,7 @@ parse_opts( [ { max_pool_size, V } | Opts ], State ) ->
 parse_opts( [ { idle_timeout, V } | Opts ], State ) ->
   parse_opts( Opts, State#state{ idle_secs = V } );
 parse_opts( [ { max_queue, V } | Opts ], State ) ->
-  parse_opts( Opts, State#state{ max_queued_tasks = V } );
+  parse_opts( Opts, State#state{ max_queued_requests = V } );
 parse_opts( [ { max_worker_age, V } | Opts ], State ) ->
   parse_opts( Opts, State#state{ max_worker_age = V } );
 parse_opts( [ { sup_max_r, V } | Opts ], State ) ->
