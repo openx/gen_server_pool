@@ -30,11 +30,18 @@
 -define(EMPTY_QUEUE, {[], []}).                 % Define empty queue for pattern matching.
 -define(M, 1000000).
 
+-record(worker, { pid :: pid(),
+                  available_time :: erlang:timestamp(),
+                  start_time :: erlang:timestamp() }).
+
+-record(request, { call_args :: term(),
+                   arrival_time :: erlang:timestamp() }).
+
 -record(state, { proxy_ref,
                  sup_pid,
                  sup_max_r,
                  sup_max_t = 1,
-                 available = [],
+                 available = [] :: list( #worker{} ),
                  requests  = queue:new(),
                  min_size  = 0,
                  max_size  = 10,
@@ -51,15 +58,6 @@
                  max_worker_age = infinity,
                  max_worker_wait = infinity
                  }).
-
--record(worker, {
-          pid,
-          available_time,
-          start_time
-}).
-
--record(request, { call_args,
-                   arrival_time }).
 
 %%====================================================================
 %% API
@@ -286,7 +284,7 @@ worker_available( Worker = #worker{ pid = Pid },
                   State = #state{ available = Workers } ) ->
   %% Return the worker to the pool and see if there is any work queued.
   %% If a child sent a message to itself then it could already be in the list.
-  case lists:keyfind( Pid, 1, Workers ) of
+  case lists:keyfind( Pid, #worker.pid, Workers ) of
     false -> do_work( State#state{ available = [ Worker | Workers ] } );
     _     -> do_work( State )
   end.
@@ -295,7 +293,7 @@ worker_available( Worker = #worker{ pid = Pid },
 %% Remove a gen_server_pool_proxy worker from the pool.  This function should
 %% not normally be called.
 worker_unavailable( Pid, State = #state{ available = Workers } ) ->
-  State#state{ available = proplists:delete( Pid, Workers ) }.
+  State#state{ available = lists:keydelete( Pid, #worker.pid, Workers ) }.
 
 
 -spec do_work(#state{}) -> #state{}.
