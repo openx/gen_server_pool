@@ -42,13 +42,13 @@
                  sup_max_t = 1,
                  available = [] :: list( #worker{} ),
                  requests  = queue:new() :: queue:queue( #request{} ),
-                 min_size  = 0,
-                 max_size  = 10,
+                 min_pool_size  = 0 :: non_neg_integer(),
+                 max_pool_size  = 10 :: pos_integer(),
                  idle_secs = infinity,
                  max_queued_requests = infinity,
                  num_queued_requests = 0,
                  num_dropped_requests = 0,
-                 module,
+                 module :: atom(),
                  pool_id,
                  prog_id,
                  wm_size = 0,
@@ -320,9 +320,9 @@ do_work( State = #state{ available = [ #worker{ pid = Pid } | Workers ],
   end.
 
 
-ensure_min_pool_size( #state{ min_size = MinSize, sup_pid = SupPid } = S ) ->
+ensure_min_pool_size( #state{ min_pool_size = MinPoolSize, sup_pid = SupPid } = S ) ->
   PoolSize = proplists:get_value( active, supervisor:count_children( SupPid ) ),
-  add_children( MinSize - PoolSize, S ).
+  add_children( MinPoolSize - PoolSize, S ).
 
 
 add_children( N, #state{} ) when N =< 0 ->
@@ -345,7 +345,7 @@ check_idle_timeouts( #state{ proxy_ref = ProxyRef,
                              sup_pid = SupPid,
                              idle_secs = IdleSecs,
                              available = Available,
-                             min_size = MinSize,
+                             min_pool_size = MinPoolSize,
                              max_worker_age = MaxWorkerAge } = S ) ->
   Now = os:timestamp(),
 
@@ -357,7 +357,7 @@ check_idle_timeouts( #state{ proxy_ref = ProxyRef,
   Survivors0 = kill_aged_workers( ProxyRef, MaxAgeTimeKill, Available, [] ),
 
   PoolSize = proplists:get_value( active, supervisor:count_children( SupPid ) ),
-  MaxWorkersToKill = PoolSize - MinSize,
+  MaxWorkersToKill = PoolSize - MinPoolSize,
   MaxIdleTimeKill = now_sub( os:timestamp(), IdleSecs * ?M ),
   Survivors = kill_idle_workers( ProxyRef, MaxIdleTimeKill, Survivors0, [], MaxWorkersToKill ),
 
@@ -392,14 +392,14 @@ check_for_worker_do( State = #state{ proxy_ref = ProxyRef }, AgedWorkerKillTime,
           Available
       end
   end;
-check_for_worker_do( #state{ sup_pid = SupPid, max_size = MaxSize }, _AgedWorkerKillTime, [] ) ->
+check_for_worker_do( #state{ sup_pid = SupPid, max_pool_size = MaxPoolSize }, _AgedWorkerKillTime, [] ) ->
   %% No workers are available.  If the total number of workers is less than
   %% the maximum, start a new one.
   PoolSize = proplists:get_value( active, supervisor:count_children( SupPid ) ),
-  %% If PoolSize is less than MinSize we should start enough workers to bring
-  %% it up, but currently the add_child call is synchronous and we don't want
-  %% to block the current request.
-  PoolSize < MaxSize andalso
+  %% If PoolSize is less than MinPoolSize we should start enough workers to
+  %% bring it up, but currently the add_child call is synchronous and we don't
+  %% want to block the current request.
+  PoolSize < MaxPoolSize andalso
     gen_server_pool_sup:add_child( SupPid ),
   [].
 
@@ -583,9 +583,9 @@ parse_opts( [ { pool_id, V } | Opts ], State ) ->
 parse_opts( [ { prog_id, V } | Opts ], State ) ->
   parse_opts( Opts, State#state{ prog_id = V } );
 parse_opts( [ { min_pool_size, V } | Opts ], State ) ->
-  parse_opts( Opts, State#state{ min_size = V } );
+  parse_opts( Opts, State#state{ min_pool_size = V } );
 parse_opts( [ { max_pool_size, V } | Opts ], State ) ->
-  parse_opts( Opts, State#state{ max_size = V } );
+  parse_opts( Opts, State#state{ max_pool_size = V } );
 parse_opts( [ { idle_timeout, V } | Opts ], State ) ->
   parse_opts( Opts, State#state{ idle_secs = V } );
 parse_opts( [ { max_queue, V } | Opts ], State ) ->
@@ -603,7 +603,7 @@ parse_opts( [ { mondemand, _ } | Opts ], State ) ->
   parse_opts( Opts, State ).
 
 
-finalize( #state{ sup_max_r = undefined, max_size = Sz } = S ) ->
+finalize( #state{ sup_max_r = undefined, max_pool_size = Sz } = S ) ->
   % Set max_r to max pool size if not set
   finalize( S#state{ sup_max_r = Sz } );
 finalize( State ) ->
