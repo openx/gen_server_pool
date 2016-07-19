@@ -29,6 +29,20 @@
 
 -define(M, 1000000).
 
+-type option() ::
+        { 'pool_id', atom() | string() } |
+        { 'prog_id', atom() | string() } |
+        { 'min_pool_size', non_neg_integer() } |
+        { 'max_pool_size', pos_integer() } |
+        { 'idle_timeout', pos_integer() | 'infinity' } |
+        { 'max_queue', non_neg_integer() } |
+        { 'max_worker_age', pos_integer() | 'infinity' } |
+        { 'sup_max_r', non_neg_integer() } |
+        { 'sup_max_t', pos_integer() } |
+        { 'request_max_wait', pos_integer() | 'infinity' } |
+        { 'mondemand', term() }.
+-type options() :: list( option() ).
+
 -record(worker, { pid :: pid(),
                   available_time :: erlang:timestamp(),
                   start_time :: erlang:timestamp() }).
@@ -574,6 +588,7 @@ schedule_collect_stats( #state{ proxy_ref = ProxyRef } ) ->
   % collect stats every 10 second.
   erlang:send_after( 1*1000, self(), { ProxyRef, collect_stats } ).
 
+-spec parse_opts(options(), #state{}) -> #state{}.
 parse_opts( [], State ) ->
   finalize( State );
 parse_opts( [ { pool_id, V } | Opts ], State ) when is_atom( V ) ->
@@ -582,21 +597,21 @@ parse_opts( [ { pool_id, V } | Opts ], State ) ->
   parse_opts( Opts, State#state{ pool_id = V } );
 parse_opts( [ { prog_id, V } | Opts ], State ) ->
   parse_opts( Opts, State#state{ prog_id = V } );
-parse_opts( [ { min_pool_size, V } | Opts ], State ) ->
+parse_opts( [ { min_pool_size, V } | Opts ], State ) when is_integer(V), V >= 0 ->
   parse_opts( Opts, State#state{ min_pool_size = V } );
-parse_opts( [ { max_pool_size, V } | Opts ], State ) ->
+parse_opts( [ { max_pool_size, V } | Opts ], State ) when is_integer(V), V >= 1 ->
   parse_opts( Opts, State#state{ max_pool_size = V } );
-parse_opts( [ { idle_timeout, V } | Opts ], State ) ->
+parse_opts( [ { idle_timeout, V } | Opts ], State ) when is_integer(V), V >= 1; V =:= 'infinity' ->
   parse_opts( Opts, State#state{ idle_secs = V } );
-parse_opts( [ { max_queue, V } | Opts ], State ) ->
+parse_opts( [ { max_queue, V } | Opts ], State ) when is_integer(V), V >= 0; V =:= 'infinity' ->
   parse_opts( Opts, State#state{ max_queued_requests = V } );
-parse_opts( [ { max_worker_age, V } | Opts ], State ) ->
+parse_opts( [ { max_worker_age, V } | Opts ], State ) when is_integer(V), V >= 1; V =:= 'infinity' ->
   parse_opts( Opts, State#state{ max_worker_age = V } );
-parse_opts( [ { sup_max_r, V } | Opts ], State ) ->
+parse_opts( [ { sup_max_r, V } | Opts ], State ) when is_integer(V), V >= 0 ->
   parse_opts( Opts, State#state{ sup_max_r = V } );
-parse_opts( [ { sup_max_t, V } | Opts ], State ) ->
+parse_opts( [ { sup_max_t, V } | Opts ], State ) when is_integer(V), V >= 1 ->
   parse_opts( Opts, State#state{ sup_max_t = V } );
-parse_opts( [ { request_max_wait, V } | Opts ], State ) ->
+parse_opts( [ { request_max_wait, V } | Opts ], State ) when is_integer(V), V >= 1; V =:= 'infinity' ->
   parse_opts( Opts, State#state{ max_worker_wait = V } );
 parse_opts( [ { mondemand, _ } | Opts ], State ) ->
   % stats option is not set in state
