@@ -54,6 +54,7 @@
                  sup_pid,
                  sup_max_r,
                  sup_max_t = 1,
+                 starter_ref :: gen_server_pool_starter:starter_ref(),
                  available = [] :: list( #worker{} ),
                  requests  = queue:new() :: queue:queue( #request{} ),
                  min_pool_size  = 0 :: non_neg_integer(),
@@ -123,9 +124,10 @@ init( [ Module, Args, Options, PoolOpts ] ) ->
   { ok, SupPid } = gen_server_pool_sup:start_link( self(), ProxyRef,
                                                    Module, Args, Options,
                                                    MaxR, MaxT ),
+  { ok, StarterRef } = gen_server_pool_starter:start_link( SupPid, [] ),
 
   % schedule periodic processing and start workers
-  setup_schedule( S#state{ sup_pid = SupPid }, PoolOpts ).
+  setup_schedule( S#state{ sup_pid = SupPid, starter_ref = StarterRef }, PoolOpts ).
 
 
 %%--------------------------------------------------------------------
@@ -223,7 +225,7 @@ code_change( _OldVsn, State, _Extra ) ->
 timestamped_request(Req) ->
   #request{call_args=Req, arrival_time=os:timestamp()}.
 
-stats( #state{ sup_pid   = SupPid,
+stats( #state{ starter_ref = StarterRef,
                available = Workers,
                wm_size = WmSize, 
                wm_active = WmActive, 
@@ -231,7 +233,7 @@ stats( #state{ sup_pid   = SupPid,
                num_queued_requests = NumQueuedRequests,
                num_dropped_requests = NumDroppedRequests
                } ) ->
-  Size   = proplists:get_value( active, supervisor:count_children( SupPid ) ),
+  Size   = gen_server_pool_starter:worker_count( StarterRef ),
   Idle   = length( Workers ),
   Active = Size - Idle,
   WmIdle = WmSize - WmActive,
@@ -246,13 +248,13 @@ stats( #state{ sup_pid   = SupPid,
     { drops, NumDroppedRequests }
   ].
 
-collect_stats ( State = #state{ sup_pid = SupPid,
+collect_stats ( State = #state{ starter_ref = StarterRef,
                                 available = Workers,
                                 num_queued_requests = NumQueuedRequests,
                                 wm_size = WmSize,
                                 wm_active = WmActive,
                                 wm_requests = WmRequests } ) ->
-  Size   = proplists:get_value( active, supervisor:count_children( SupPid ) ),
+  Size   = gen_server_pool_starter:worker_count( StarterRef ),
   Idle   = length( Workers ),
   Active = Size - Idle,
 
@@ -333,18 +335,8 @@ do_work( State = #state{ available = [ #worker{ pid = Pid } | Workers ],
   end.
 
 
-ensure_min_pool_size( #state{ min_pool_size = MinPoolSize, sup_pid = SupPid } = S ) ->
-  PoolSize = proplists:get_value( active, supervisor:count_children( SupPid ) ),
-  add_children( MinPoolSize - PoolSize, S ).
-
-
-add_children( N, #state{} ) when N =< 0 ->
-  ok;
-add_children( N, #state{ sup_pid = SupPid } = S ) ->
-  case gen_server_pool_sup:add_child( SupPid ) of
-    { error, Error } -> Error;
-    _                -> add_children( N-1, S )
-  end.
+ensure_min_pool_size( #state{ starter_ref = StarterRef, min_pool_size = MinPoolSize }, Synchronicity ) ->
+  gen_server_pool_starter:ensure_min_workers( StarterRef, MinPoolSize, Synchronicity ).
 
 
 schedule_idle_check( #state{ max_worker_idle_ms = infinity } ) -> ok;
@@ -355,20 +347,20 @@ schedule_idle_check( #state{ proxy_ref = ProxyRef, max_worker_idle_ms = MaxWorke
 check_idle_timeouts( #state{ available = [] } = S ) ->
   S;
 check_idle_timeouts( #state{ proxy_ref = ProxyRef,
-                             sup_pid = SupPid,
+                             starter_ref = StarterRef,
                              max_worker_idle_ms = MaxWorkerIdleMS,
                              available = Available,
                              min_pool_size = MinPoolSize } = S ) ->
   MaxAgeTimeKill = aged_worker_kill_time( S ),
   Survivors0 = kill_aged_workers( ProxyRef, MaxAgeTimeKill, Available, [] ),
 
-  PoolSize = proplists:get_value( active, supervisor:count_children( SupPid ) ),
+  PoolSize = gen_server_pool_starter:worker_count( StarterRef ),
   MaxWorkersToKill = PoolSize - MinPoolSize,
   MaxIdleTimeKill = now_sub( os:timestamp(), MaxWorkerIdleMS * 1000 ),
   Survivors = kill_idle_workers( ProxyRef, MaxIdleTimeKill, Survivors0, [], MaxWorkersToKill ),
 
   State = S#state{ available = Survivors },
-  ensure_min_pool_size( State ),
+  ensure_min_pool_size( State, async ),
 
   State.
 
@@ -398,15 +390,11 @@ check_for_worker_do( State = #state{ proxy_ref = ProxyRef }, AgedWorkerKillTime,
           Available
       end
   end;
-check_for_worker_do( #state{ sup_pid = SupPid, max_pool_size = MaxPoolSize }, _AgedWorkerKillTime, [] ) ->
+check_for_worker_do( #state{ starter_ref = StarterRef, min_pool_size = MinPoolSize, max_pool_size = MaxPoolSize },
+                     _AgedWorkerKillTime, [] ) ->
   %% No workers are available.  If the total number of workers is less than
   %% the maximum, start a new one.
-  PoolSize = proplists:get_value( active, supervisor:count_children( SupPid ) ),
-  %% If PoolSize is less than MinPoolSize we should start enough workers to
-  %% bring it up, but currently the add_child call is synchronous and we don't
-  %% want to block the current request.
-  PoolSize < MaxPoolSize andalso
-    gen_server_pool_sup:add_child( SupPid ),
+  gen_server_pool_starter:add_worker( StarterRef, MinPoolSize, MaxPoolSize, async ),
   [].
 
 
@@ -418,9 +406,7 @@ return_worker_to_pool( State = #state{ proxy_ref = ProxyRef, available = Availab
     true ->
       %% The worker is too old; kill it.
       gen_server_pool_proxy:stop( Pid, ProxyRef ),
-      %% It would be better to use an asynchronous call to ensure
-      %% the pool size.
-      ensure_min_pool_size( State ),
+      ensure_min_pool_size( State, async ),
       State;
     false ->
       %% If a child sent a message to itself then it could already be in the list.
@@ -639,7 +625,7 @@ setup_schedule( State, PoolOpts ) ->
   end,
 
   % start min_pool_size workers and schedule idle time check
-  case ensure_min_pool_size( State ) of
+  case ensure_min_pool_size( State, sync ) of
     ok ->
       schedule_idle_check( State ),
       { ok, State };
