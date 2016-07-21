@@ -13,6 +13,7 @@
 %% API
 -export([ start_link/4,
           start_link/5,
+          stop/1,
           get_stats/1,
           get_pool_pids/1,
           available/4,
@@ -87,6 +88,9 @@ start_link( Name, Module, Args, Options, PoolOpts ) ->
                          [ Module, Args, Options, PoolOpts ],
                          Options ).
 
+stop( MgrPid ) ->
+  gen_server:call( MgrPid, stop ).
+
 get_stats( MgrPid ) ->
   gen_server:call( MgrPid, gen_server_pool_stats ).
 
@@ -150,6 +154,9 @@ handle_call( {unavailable, Pid}, _From, State ) ->
   NewState = worker_unavailable( Pid, State ),
   { reply, {ok, Pid}, NewState };
 
+handle_call( stop, _From, State ) ->
+  { stop, normal, ok, State };
+
 handle_call( Call, From, State ) ->
   NewState = handle_request( { '$gen_call', From, Call }, State ),
   { noreply, NewState }.
@@ -164,9 +171,6 @@ handle_cast( { ProxyRef, worker_available, Worker=#worker{} },
              State = #state{ proxy_ref = ProxyRef } ) ->
   NewState = worker_available( Worker, State ),
   { noreply, NewState };
-
-handle_cast( stop, State ) ->
-  { stop, normal, State };
 
 handle_cast( Cast, State ) ->
   NewState = handle_request( { '$gen_cast', Cast }, State ),
@@ -207,8 +211,11 @@ handle_info( Info, State ) ->
 %% cleaning up. When it returns, the gen_server terminates with Reason.
 %% The return value is ignored.
 %%--------------------------------------------------------------------
-terminate( Reason, State ) ->
-  terminate_pool( Reason, State ),
+terminate( _Reason, #state{ starter_ref = StarterRef } ) ->
+  %% FIXME: The gen_server_pool_sup is linked, and so it will exit
+  %% automatically, but we need to kill the gen_server_pool_starter.  It would
+  %% be better to use a proper supervision tree.
+  gen_server_pool_starter:stop( StarterRef ),
   ok.
 
 %%--------------------------------------------------------------------
@@ -281,9 +288,6 @@ emit_stats( #state{ prog_id = ProgId, pool_id = PoolId } = S ) ->
      wm_active = 0,
      wm_requests = 0,
      num_dropped_requests = 0 }.
-
-terminate_pool( _Reason, _State ) ->
-  ok.
 
 
 -spec handle_request(term(), #state{}) -> #state{}.

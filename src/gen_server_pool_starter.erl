@@ -3,6 +3,7 @@
 -behaviour(gen_server).
 
 -export([ start_link/2,
+          stop/1,
           add_worker/4,
           ensure_min_workers/3,
           worker_count/1,
@@ -30,6 +31,10 @@
 start_link( GenServerPoolSupPid, Options ) ->
   { ok, Pid } = gen_server:start_link( ?MODULE, GenServerPoolSupPid, Options ),
   { ok, { Pid, GenServerPoolSupPid } }.
+
+
+stop( { SelfPid, _ } ) ->
+  gen_server:call( SelfPid, stop ).
 
 
 -spec add_worker(starter_ref(), MinPoolSize::non_neg_integer(), MaxPoolSize::pos_integer(), synchronicity()) -> 'ok' | { 'error', Reason::term() }.
@@ -77,7 +82,10 @@ worker_count( { _, GenServerPoolSupPid } ) ->
 init( GenServerPoolSupPid ) ->
   { ok, #state{ gen_server_pool_sup_pid = GenServerPoolSupPid } }.
 
-handle_call( request, _From, State) ->
+handle_call( stop, _From, State ) ->
+  { stop, normal, ok, State };
+
+handle_call( request, _From, State ) ->
   { reply, ok, State }.
 
 handle_cast( { add_worker, MinPoolSize, MaxPoolSize }, State = #state{ gen_server_pool_sup_pid = GenServerPoolSupPid } ) ->
