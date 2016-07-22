@@ -17,11 +17,14 @@ start_link([]) ->
 init( [] ) ->
   { ok, {} }.
 
-handle_call( { delay_task, MS, N }, _From, State ) ->
-  timer:sleep( MS ),
+handle_call( { delay_task, DelayMS, N }, _From, State ) ->
+  timer:sleep( DelayMS ),
   { reply, N, State };
 handle_call( { echo, Msg }, _From, State ) ->
-  { reply, Msg, State }.
+  { reply, Msg, State };
+handle_call( { die_after, DieAfterMS }, _From, State ) ->
+  erlang:send_after( DieAfterMS, self(), time_to_die ),
+  { reply, ok, State }.
 
 handle_cast( { send_message, To, Msg }, State ) ->
   To ! Msg,
@@ -31,6 +34,8 @@ handle_cast( Msg, State ) ->
                          [ ?FILE, ?LINE, ?MODULE, Msg ] ),
   { noreply, State }.
 
+handle_info( time_to_die, State ) ->
+  { stop, normal, State };
 handle_info( _Info, State ) ->
   { noreply, State }.
 

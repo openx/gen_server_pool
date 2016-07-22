@@ -93,6 +93,7 @@ timeout_test_() ->
       [ ?_test( t_timeout( ?TIMEOUT_POOL ) )
       , ?_test( t_dropped( ?TIMEOUT_POOL ) )
       , ?_test( t_call( ?TIMEOUT_POOL ) )
+      , ?_test( t_monitor( ?TIMEOUT_POOL ) )
       ]
     } }.
 
@@ -138,3 +139,18 @@ t_dropped( PoolId ) ->
   Stats2 = gen_server_pool:get_stats( PoolId ),
   ?assertEqual( ?TIMEOUT_MAXPOOL, proplists:get_value( size, Stats2 ) ),
   ?assert(proplists:get_value( drops, Stats2 ) >= 1 ).
+
+t_monitor( PoolId ) ->
+  DieDelay = 200,
+  Stats1 = gen_server_pool:get_stats( PoolId ),
+  ?assertEqual( ?TIMEOUT_MINPOOL, proplists:get_value( size, Stats1 ) ),
+  ?assertEqual( ?TIMEOUT_MINPOOL, proplists:get_value( size_monitor, Stats1 ) ),
+  spawn_tasks( PoolId, 1, ?TIMEOUT_MAXPOOL, ?TIMEOUT_MAXWAIT ),
+  gen_server:call( PoolId, { die_after, DieDelay } ),
+  Stats2 = gen_server_pool:get_stats( PoolId ),
+  ?assertEqual( ?TIMEOUT_MAXPOOL, proplists:get_value( size, Stats2 ) ),
+  ?assertEqual( ?TIMEOUT_MAXPOOL, proplists:get_value( size_monitor, Stats2 ) ),
+  timer:sleep( DieDelay + 10 ),
+  Stats3 = gen_server_pool:get_stats( PoolId ),
+  ?assertEqual( ?TIMEOUT_MAXPOOL - 1, proplists:get_value( size, Stats3 ) ),
+  ?assertEqual( ?TIMEOUT_MAXPOOL - 1, proplists:get_value( size_monitor, Stats3 ) ).

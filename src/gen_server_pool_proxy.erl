@@ -10,6 +10,8 @@
 
 -behaviour(gen_server).
 
+-include("gen_server_pool_internal.hrl").
+
 %% API
 -export([ start_link/5,
           stop/2 ]).
@@ -53,10 +55,10 @@ init( [ MgrPid, ProxyRef, Module, Args ] ) ->
 
   case Module:init( Args ) of
     { ok, State } ->
-      gen_server_pool:available( MgrPid, ProxyRef, self(), PState#state.worker_starttime ),
+      gen_server_pool:available( MgrPid, ProxyRef, self(), PState#state.worker_starttime, ?GSP_FLAG_INITIAL ),
       { ok, state( PState, State ) };
     { ok, State, Extra } ->
-      gen_server_pool:available( MgrPid, ProxyRef, self(), PState#state.worker_starttime ),
+      gen_server_pool:available( MgrPid, ProxyRef, self(), PState#state.worker_starttime, ?GSP_FLAG_INITIAL ),
       { ok, state( PState, State ), Extra };
     Other ->
       Other
@@ -81,10 +83,10 @@ handle_call( Msg,
   % available.
   case M:handle_call( Msg, { self(), FromRef }, S ) of
     { reply, Reply, NewS } ->
-      gen_server_pool:available( MgrPid, ProxyRef, self(), WorkerStartTime ),
+      gen_server_pool:available( MgrPid, ProxyRef, self(), WorkerStartTime, ?GSP_FLAG_NONE ),
       { reply, Reply, state( PState, NewS ) };
     { reply, Reply, NewS, Extra } ->
-      gen_server_pool:available( MgrPid, ProxyRef, self(), WorkerStartTime ),
+      gen_server_pool:available( MgrPid, ProxyRef, self(), WorkerStartTime, ?GSP_FLAG_NONE ),
       { reply, Reply, state( PState, NewS ), Extra };
     { noreply, NewS } ->
       { noreply, state( PState#state{ noreply_target = From }, NewS ) };
@@ -105,10 +107,10 @@ handle_cast( Msg,
                      state       = S } = PState ) ->
   case M:handle_cast( Msg, S ) of
     { noreply, NewS } ->
-      gen_server_pool:available( MgrPid, ProxyRef, self(), WorkerStartTime ),
+      gen_server_pool:available( MgrPid, ProxyRef, self(), WorkerStartTime, ?GSP_FLAG_NONE ),
       { noreply, state( PState, NewS ) };
     { noreply, NewS, Extra } ->
-      gen_server_pool:available( MgrPid, ProxyRef, self(), WorkerStartTime ),
+      gen_server_pool:available( MgrPid, ProxyRef, self(), WorkerStartTime, ?GSP_FLAG_NONE ),
       { noreply, state( PState, NewS ), Extra };
     { stop, Reason, NewS } ->
       { stop, Reason, state( PState, NewS ) }
@@ -126,7 +128,7 @@ handle_info( {Tag, ProxyMsg},
                      noreply_target = {Target,Tag}
                    } = PState ) ->
   Target ! { Tag, ProxyMsg },
-  gen_server_pool:available( MgrPid, ProxyRef, self(), WorkerStartTime ),
+  gen_server_pool:available( MgrPid, ProxyRef, self(), WorkerStartTime, ?GSP_FLAG_NONE ),
   { noreply, PState#state{ noreply_target = undefined } };
 handle_info( Msg,
              #state{ module      = M,

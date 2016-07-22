@@ -10,13 +10,15 @@
 
 -behaviour(gen_server).
 
+-include("gen_server_pool_internal.hrl").
+
 %% API
 -export([ start_link/4,
           start_link/5,
           stop/1,
           get_stats/1,
           get_pool_pids/1,
-          available/4,
+          available/5,
           unavailable/2
         ]).
 
@@ -64,6 +66,7 @@
                  max_worker_idle_ms = infinity,
                  max_queued_requests = infinity,
                  max_request_wait_ms = infinity,
+                 cur_pool_size = 0,
                  num_queued_requests = 0,
                  num_dropped_requests = 0,
                  module :: atom(),
@@ -94,11 +97,11 @@ stop( MgrPid ) ->
 get_stats( MgrPid ) ->
   gen_server:call( MgrPid, gen_server_pool_stats ).
 
-available( MgrPid, ProxyRef, WorkerPid, WorkerStartTime ) ->
+available( MgrPid, ProxyRef, WorkerPid, WorkerStartTime, Flags ) ->
   Worker = #worker{ pid = WorkerPid, 
                     available_time = os:timestamp(), 
                     start_time = WorkerStartTime },
-  gen_server:cast( MgrPid, { ProxyRef, worker_available, Worker } ).
+  gen_server:cast( MgrPid, { ProxyRef, worker_available, Worker, Flags } ).
 
 unavailable( MgrPid, WorkerPid ) ->
   gen_server:call( MgrPid, { unavailable, WorkerPid } ).
@@ -167,9 +170,9 @@ handle_call( Call, From, State ) ->
 %%                                      {stop, Reason, State}
 %% Description: Handling cast messages
 %%--------------------------------------------------------------------
-handle_cast( { ProxyRef, worker_available, Worker=#worker{} },
+handle_cast( { ProxyRef, worker_available, Worker=#worker{}, Flag },
              State = #state{ proxy_ref = ProxyRef } ) ->
-  NewState = worker_available( Worker, State ),
+  NewState = worker_available( Worker, Flag, State ),
   { noreply, NewState };
 
 handle_cast( Cast, State ) ->
@@ -198,6 +201,10 @@ handle_info( { ProxyRef, check_idle_timeouts },
              #state{ proxy_ref = ProxyRef } = State ) ->
   NewState = check_idle_timeouts( State ),
   schedule_idle_check( State ),
+  { noreply, NewState };
+
+handle_info( { 'DOWN', _MonitorRef, process, Pid, _Info }, State ) ->
+  NewState = demonitor_worker( State, Pid ),
   { noreply, NewState };
 
 handle_info( Info, State ) ->
@@ -237,6 +244,7 @@ stats( #state{ starter_ref = StarterRef,
                wm_size = WmSize, 
                wm_active = WmActive, 
                wm_requests = WmRequests,
+               cur_pool_size = CurPoolSize,
                num_queued_requests = NumQueuedRequests,
                num_dropped_requests = NumDroppedRequests
                } ) ->
@@ -245,6 +253,7 @@ stats( #state{ starter_ref = StarterRef,
   Active = Size - Idle,
   WmIdle = WmSize - WmActive,
   [ { size, Size },
+    { size_monitor, CurPoolSize },
     { active, Active },
     { idle, Idle },
     { tasks, NumQueuedRequests },
@@ -299,12 +308,13 @@ handle_request( Request, State ) ->
   State3 = enqueue_request( State2, Request ),
   do_work( State3 ).
 
--spec worker_available(#worker{}, #state{}) -> #state{}.
+-spec worker_available(#worker{}, Flag::non_neg_integer(), #state{}) -> #state{}.
 %% Return a gen_server_pool_proxy worker to the pool.
-worker_available( Worker, State ) ->
-  State1 = return_worker_to_pool( State, Worker ),
-  State2 = time_out_requests( State1 ),
-  do_work( State2 ).
+worker_available( Worker, Flag, State ) ->
+  State1 = monitor_worker_if_initial( State, Worker, Flag ),
+  State2 = return_worker_to_pool( State1, Worker ),
+  State3 = time_out_requests( State2 ),
+  do_work( State3 ).
 
 -spec worker_unavailable(pid(), #state{}) -> #state{}.
 %% Remove a gen_server_pool_proxy worker from the pool.  This function should
@@ -399,6 +409,26 @@ check_for_worker_do( #state{ starter_ref = StarterRef, min_pool_size = MinPoolSi
   %% No workers are available.  If the total number of workers is less than
   %% the maximum, start a new one.
   gen_server_pool_starter:add_worker( StarterRef, MinPoolSize, MaxPoolSize, async ),
+  [].
+
+
+monitor_worker_if_initial( State = #state{ cur_pool_size = CurPoolSize }, #worker{ pid = Pid }, Flag ) ->
+  if Flag band ?GSP_FLAG_INITIAL =:= 0 ->
+      State;
+     true ->
+      monitor( process, Pid ),
+      State#state{ cur_pool_size = CurPoolSize + 1 }
+  end.
+
+demonitor_worker( State = #state{ available = Available, cur_pool_size = CurPoolSize }, Pid ) ->
+  Available1 = remove_worker_from_available( Available, Pid ),
+  State#state{ available = Available1, cur_pool_size = CurPoolSize - 1 }.
+
+remove_worker_from_available( [ FirstAvailable = #worker{ pid = WorkerPid } | RestAvailable ], DeadPid ) ->
+  if WorkerPid =:= DeadPid -> RestAvailable;
+     true                  -> [ FirstAvailable | remove_worker_from_available( RestAvailable, DeadPid ) ]
+  end;
+remove_worker_from_available( [], _DeadPid ) ->
   [].
 
 
