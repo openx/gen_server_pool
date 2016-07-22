@@ -20,6 +20,9 @@ init( [] ) ->
 handle_call( { delay_task, DelayMS, N }, _From, State ) ->
   timer:sleep( DelayMS ),
   { reply, N, State };
+handle_call( { worker_pid, DelayMS }, _From, State ) ->
+  DelayMS > 0 andalso timer:sleep( DelayMS ),
+  { reply, self(), State };
 handle_call( { echo, Msg }, _From, State ) ->
   { reply, Msg, State };
 handle_call( { die_after, DieAfterMS }, _From, State ) ->
@@ -28,10 +31,6 @@ handle_call( { die_after, DieAfterMS }, _From, State ) ->
 
 handle_cast( { send_message, To, Msg }, State ) ->
   To ! Msg,
-  { noreply, State };
-handle_cast( Msg, State ) ->
-  error_logger:info_msg( "~s:~B - ~s:handle_cast/2 - unknown message, Msg:[~p]~n",
-                         [ ?FILE, ?LINE, ?MODULE, Msg ] ),
   { noreply, State }.
 
 handle_info( time_to_die, State ) ->
@@ -42,6 +41,7 @@ handle_info( _Info, State ) ->
 terminate( Reason, _State ) ->
   case Reason of
     shutdown -> ok;
+    normal -> ok;
     _ ->
       error_logger:info_msg( "~s:~B - ~s:terminate/2 - reason ~w\n",
                              [ ?FILE, ?LINE, ?MODULE, Reason ] ),

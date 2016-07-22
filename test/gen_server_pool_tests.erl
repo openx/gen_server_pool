@@ -2,6 +2,9 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
+%%-define(OUTPUT_STREAM, user).
+-define(OUTPUT_STREAM, standard_io).
+
 -define(BASIC_MINPOOL, 2).
 -define(BASIC_MAXPOOL, 4).
 -define(BASIC_MAXQUEUE, 4).
@@ -73,9 +76,9 @@ spawn_tasks( PoolId, First, Count, Delay ) ->
     fun ( N ) ->
         spawn( fun () ->
                    case gen_server:call( PoolId, { delay_task, Delay, N } ) of
-                     N -> %% io:format( user, "got ~p\n", [ N ] ),
+                     N -> %% io:format( ?OUTPUT_STREAM, "got ~p\n", [ N ] ),
                           ok;
-                     R -> io:format( standard_error, "unexpected response ~p for ~p\n", [ R, N ] )
+                     R -> io:format( ?OUTPUT_STREAM, "unexpected response ~p for ~p\n", [ R, N ] )
                    end
                end ),
         timer:sleep( 1 )
@@ -154,3 +157,46 @@ t_monitor( PoolId ) ->
   Stats3 = gen_server_pool:get_stats( PoolId ),
   ?assertEqual( ?TIMEOUT_MAXPOOL - 1, proplists:get_value( size, Stats3 ) ),
   ?assertEqual( ?TIMEOUT_MAXPOOL - 1, proplists:get_value( size_monitor, Stats3 ) ).
+
+
+-define(AGE_AGE, 100).
+age_setup() ->
+  PoolId = age_pool,
+  PoolOpts = [ { min_pool_size, 0 },
+               { max_pool_size, 1 },
+               { max_worker_age_ms, ?AGE_AGE } ],
+  gen_server_pool:start_link( { local, PoolId }, simple_server, [], [], PoolOpts),
+  PoolId.
+
+age_test_() ->
+  { "Age Tests",
+    inorder,
+    { setup, fun age_setup/0, fun cleanup/1,
+      { with, [ fun t_age/1
+              ] } } }.
+
+t_age( PoolId ) ->
+  Stats1 = gen_server_pool:get_stats( PoolId ),
+  ?assertEqual( 0, proplists:get_value( size, Stats1 ) ),
+  Pid1 = gen_server:call( PoolId, { worker_pid, 0 } ),
+  Stats2 = gen_server_pool:get_stats( PoolId ),
+  ?assertEqual( 1, proplists:get_value( size, Stats2 ) ),
+  timer:sleep( ?AGE_AGE div 2 ),
+  ?assertEqual( Pid1, gen_server:call( PoolId, { worker_pid, ?AGE_AGE + 10 } ) ),
+  %% There should be no living workers because the previous call made the
+  %% (one) worker outlive its lifetime, and so it should have been killed
+  %% rather than be returned to the available pool.
+  Stats3 = gen_server_pool:get_stats( PoolId ),
+  ?assertEqual( 0, proplists:get_value( size, Stats3 ) ),
+  %% And so a new worker will be started for this request.
+  Pid2 = gen_server:call( PoolId, { worker_pid, 10 } ),
+  ?assertNotEqual( Pid1, Pid2 ),
+  Stats4 = gen_server_pool:get_stats( PoolId ),
+  ?assertEqual( 1, proplists:get_value( size, Stats4 ) ),
+  timer:sleep( ?AGE_AGE ),
+  %% The previous worker, if it is still alive, has outlived its lifetime and
+  %% so will be killed and a new worker started for the next request.
+  Pid3 = gen_server:call( PoolId, { worker_pid, 10 } ),
+  ?assertNotEqual( Pid2, Pid3 ),
+  Stats5 = gen_server_pool:get_stats( PoolId ),
+  ?assertEqual( 1, proplists:get_value( size, Stats5 ) ).

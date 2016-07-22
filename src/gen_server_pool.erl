@@ -30,6 +30,9 @@
           terminate/2,
           code_change/3 ]).
 
+%% utilities
+-export([ now_add/2 ]).
+
 -define(M, 1000000).
 
 -type option() ::
@@ -37,9 +40,9 @@
         { 'prog_id', atom() | string() } |
         { 'min_pool_size', non_neg_integer() } |
         { 'max_pool_size', pos_integer() } |
-        { 'max_worker_age_ms', pos_integer() | 'infinity' } |
+        { 'max_worker_age_ms', pos_integer() | { pos_integer(), pos_integer() } | { atom(), atom(), list() } | 'infinity' } |
         { 'max_worker_idle_ms', pos_integer() | 'infinity' } |
-        { 'max_queued_requests', non_neg_integer() } |
+        { 'max_queued_requests', non_neg_integer() | 'infinity' } |
         { 'max_request_wait_ms', pos_integer() | 'infinity' } |
         { 'sup_max_r', non_neg_integer() } |
         { 'sup_max_t', pos_integer() } |
@@ -48,7 +51,7 @@
 
 -record(worker, { pid :: pid(),
                   available_time :: erlang:timestamp(),
-                  start_time :: erlang:timestamp() }).
+                  end_time :: erlang:timestamp() | 'infinity' } ).
 
 -record(request, { call_args :: term(),
                    arrival_time :: erlang:timestamp() }).
@@ -97,10 +100,10 @@ stop( MgrPid ) ->
 get_stats( MgrPid ) ->
   gen_server:call( MgrPid, gen_server_pool_stats ).
 
-available( MgrPid, ProxyRef, WorkerPid, WorkerStartTime, Flags ) ->
+available( MgrPid, ProxyRef, WorkerPid, WorkerEndTime, Flags ) ->
   Worker = #worker{ pid = WorkerPid, 
                     available_time = os:timestamp(), 
-                    start_time = WorkerStartTime },
+                    end_time = WorkerEndTime },
   gen_server:cast( MgrPid, { ProxyRef, worker_available, Worker, Flags } ).
 
 unavailable( MgrPid, WorkerPid ) ->
@@ -125,10 +128,11 @@ init( [ Module, Args, Options, PoolOpts ] ) ->
   S = parse_opts( PoolOpts, #state{ module = Module } ),
 
   % Get config from state
-  #state{ proxy_ref = ProxyRef, sup_max_r = MaxR, sup_max_t = MaxT } = S,
+  #state{ proxy_ref = ProxyRef, max_worker_age_ms = MaxWorkerAgeMS,
+          sup_max_r = MaxR, sup_max_t = MaxT } = S,
 
   % Start supervisor for pool members
-  { ok, SupPid } = gen_server_pool_sup:start_link( self(), ProxyRef,
+  { ok, SupPid } = gen_server_pool_sup:start_link( self(), ProxyRef, MaxWorkerAgeMS,
                                                    Module, Args, Options,
                                                    MaxR, MaxT ),
   { ok, StarterRef } = gen_server_pool_starter:start_link( SupPid, [] ),
@@ -365,8 +369,7 @@ check_idle_timeouts( #state{ proxy_ref = ProxyRef,
                              max_worker_idle_ms = MaxWorkerIdleMS,
                              available = Available,
                              min_pool_size = MinPoolSize } = S ) ->
-  MaxAgeTimeKill = aged_worker_kill_time( S ),
-  Survivors0 = kill_aged_workers( ProxyRef, MaxAgeTimeKill, Available, [] ),
+  Survivors0 = kill_aged_workers( ProxyRef, os:timestamp(), Available, [] ),
 
   PoolSize = gen_server_pool_starter:worker_count( StarterRef ),
   MaxWorkersToKill = PoolSize - MinPoolSize,
@@ -383,29 +386,28 @@ check_idle_timeouts( #state{ proxy_ref = ProxyRef,
 %% total number of workers is less than the maximum, starts a new worker.
 %% Returns the updated state.
 check_for_worker( State = #state{ available = Available } ) ->
-  AgedWorkerKillTime = aged_worker_kill_time( State ),
-  AvailableOut = check_for_worker_do( State, AgedWorkerKillTime, Available ),
+  AvailableOut = check_for_worker_do( State, os:timestamp(), Available ),
   State#state{ available = AvailableOut }.
 
-check_for_worker_do( State = #state{ proxy_ref = ProxyRef }, AgedWorkerKillTime,
+check_for_worker_do( State = #state{ proxy_ref = ProxyRef }, Now,
                      Available = [ Worker = #worker{ pid = Pid } | RemainingWorkers ] ) ->
   case is_process_alive( Pid ) of
     false     ->
       %% Worker is dead; drop it and try again.
-      check_for_worker_do( State, AgedWorkerKillTime, RemainingWorkers );
+      check_for_worker_do( State, Now, RemainingWorkers );
     true ->
-      case worker_too_old( Worker, AgedWorkerKillTime ) of
+      case worker_too_old( Worker, Now ) of
         true ->
           %% Worker is alive, but too old; kill it and try again.
           gen_server_pool_proxy:stop( Pid, ProxyRef ),
-          check_for_worker_do( State, AgedWorkerKillTime, RemainingWorkers );
+          check_for_worker_do( State, Now, RemainingWorkers );
         false ->
           %% Worker is alive and not too old; return.
           Available
       end
   end;
 check_for_worker_do( #state{ starter_ref = StarterRef, min_pool_size = MinPoolSize, max_pool_size = MaxPoolSize },
-                     _AgedWorkerKillTime, [] ) ->
+                     _Now, [] ) ->
   %% No workers are available.  If the total number of workers is less than
   %% the maximum, start a new one.
   gen_server_pool_starter:add_worker( StarterRef, MinPoolSize, MaxPoolSize, async ),
@@ -435,8 +437,7 @@ remove_worker_from_available( [], _DeadPid ) ->
 %% Returns a worker to the pool, unless it is too old, in which case it is
 %% killed.
 return_worker_to_pool( State = #state{ proxy_ref = ProxyRef, available = Available }, Worker = #worker{ pid = Pid } ) ->
-  AgedWorkerKillTime = aged_worker_kill_time( State ),
-  case worker_too_old( Worker, AgedWorkerKillTime ) of
+  case worker_too_old( Worker, os:timestamp() ) of
     true ->
       %% The worker is too old; kill it.
       gen_server_pool_proxy:stop( Pid, ProxyRef ),
@@ -507,16 +508,16 @@ enqueue_request( State = #state{ requests = Requests,
 %% Enforce max_worker_age and prune the worker list of dead processes.  This
 %% function reverses the order of the worker list; it will be reversed again
 %% by kill_idle_workers.  maintaining the order of the worker list.
-kill_aged_workers( _ProxyRef, _TimeKill, [], Survivors ) ->
+kill_aged_workers( _ProxyRef, _Now, [], Survivors ) ->
   Survivors;
-kill_aged_workers( ProxyRef, TimeKill, [ Worker = #worker{ pid = Pid } | Available ], Survivors ) ->
+kill_aged_workers( ProxyRef, Now, [ Worker = #worker{ pid = Pid } | Available ], Survivors ) ->
   case is_process_alive( Pid ) of
-    false     -> kill_aged_workers( ProxyRef, TimeKill, Available, Survivors );                 % Worker is dead; drop it.
+    false     -> kill_aged_workers( ProxyRef, Now, Available, Survivors );                 % Worker is dead; drop it.
     true ->
-      case worker_too_old( Worker, TimeKill ) of
+      case worker_too_old( Worker, Now ) of
         true  -> gen_server_pool_proxy:stop( Pid, ProxyRef ),                                   % Worker is alive, but too old; kill it.
-                 kill_aged_workers( ProxyRef, TimeKill, Available, Survivors );
-        false -> kill_aged_workers( ProxyRef, TimeKill, Available, [ Worker | Survivors ] )     % Worker is alive and not too old; keep it.
+                 kill_aged_workers( ProxyRef, Now, Available, Survivors );
+        false -> kill_aged_workers( ProxyRef, Now, Available, [ Worker | Survivors ] )     % Worker is alive and not too old; keep it.
       end
   end.
 
@@ -544,22 +545,16 @@ kill_idle_workers( ProxyRef, TimeKill, [ Worker = #worker{ pid = Pid, available_
   end.
 
 
-aged_worker_kill_time( #state{ max_worker_age_ms = infinity } ) ->
-  undefined;
-aged_worker_kill_time( #state{ max_worker_age_ms = MaxWorkerAgeMS } ) ->
-  now_sub( os:timestamp(), MaxWorkerAgeMS * 1000 ).
-
-
 request_timeout_time( #state{ max_request_wait_ms = infinity } ) ->
   undefined;
 request_timeout_time( #state{ max_request_wait_ms = MaxRequestWaitMS } ) ->
   now_sub( os:timestamp(), MaxRequestWaitMS * 1000 ).
 
 
-worker_too_old( _Worker, undefined ) ->
+worker_too_old( #worker{ end_time = infinity }, _Now ) ->
   false;
-worker_too_old( #worker{ start_time = StartTime }, AgedWorkerKillTime ) ->
-  timer:now_diff( AgedWorkerKillTime, StartTime ) > 0.
+worker_too_old( #worker{ end_time = EndTime }, Now ) ->
+  timer:now_diff( Now, EndTime ) > 0.
 
 
 request_too_old( _Request, undefined ) ->
@@ -584,6 +579,19 @@ now_sub( { Megas, Secs, Micros }, SubMicros ) ->
       SecsOut0                    -> {SecsOut0 + ?M, SubMegas2 + 1}
     end,
   {Megas - SubMegas3, SecsOut, MicrosOut}.
+
+now_add( { Megas, Secs, Micros }, AddMicros ) when is_integer(AddMicros), AddMicros >= 0 ->
+  Micros0 = Micros + AddMicros,
+  if Micros0 < ?M                            -> { Megas, Secs, Micros0 };
+     true ->
+      Micros1 = Micros0 rem ?M,
+      Secs1 = Secs + Micros0 div ?M,
+      if Secs1 < ?M                          -> { Megas, Secs1, Micros1 };
+         true ->
+          Secs2 = Secs1 rem ?M,
+          Megas2 = Megas + Secs1 div ?M,        { Megas2, Secs2, Micros1 }
+      end
+  end.
 
 
 schedule_emit_stats( #state{ prog_id = undefined } ) ->
@@ -614,6 +622,12 @@ parse_opts( [ { min_pool_size, V } | Opts ], State ) when is_integer(V), V >= 0 
 parse_opts( [ { max_pool_size, V } | Opts ], State ) when is_integer(V), V >= 1 ->
   parse_opts( Opts, State#state{ max_pool_size = V } );
 parse_opts( [ { max_worker_age_ms, V } | Opts ], State ) when is_integer(V), V >= 1; V =:= 'infinity' ->
+  parse_opts( Opts, State#state{ max_worker_age_ms = V } );
+parse_opts( [ { max_worker_age_ms, V = { MaxAgeMS, JitterMS } } | Opts ], State )
+  when is_integer(MaxAgeMS), MaxAgeMS > 1, is_integer(JitterMS), JitterMS > 0 ->
+  parse_opts( Opts, State#state{ max_worker_age_ms = V } );
+parse_opts( [ { max_worker_age_ms, V = { Module, Function, Args } } | Opts ], State )
+  when is_atom(Module), is_atom(Function), is_list(Args) ->
   parse_opts( Opts, State#state{ max_worker_age_ms = V } );
 parse_opts( [ { max_worker_idle_ms, V } | Opts ], State ) when is_integer(V), V >= 1; V =:= 'infinity' ->
   parse_opts( Opts, State#state{ max_worker_idle_ms = V } );
@@ -674,18 +688,26 @@ setup_schedule( State, PoolOpts ) ->
 -include_lib("eunit/include/eunit.hrl").
 
 now_sub_test() ->
-  ?assertEqual( { 1, 2, 3 },            now_sub( { 1, 2, 4 }, 1 )),
-  ?assertEqual( { 1, 2, 3 },            now_sub( { 1, 3, 3 }, ?M )),
-  ?assertEqual( { 1, 2, 3 },            now_sub( { 1, 3, 4 }, ?M + 1 )),
-  ?assertEqual( { 1, 2, 3 },            now_sub( { 1, 3, 2 }, ?M - 1 )),
-  ?assertEqual( { 1, 2, 3 },            now_sub( { 2, 2, 3 }, ?M * ?M )),
-  ?assertEqual( { 1, 2, 3 },            now_sub( { 2, 2, 4 }, ?M * ?M + 1 )),
-  ?assertEqual( { 1, 2, 3 },            now_sub( { 2, 2, 2 }, ?M * ?M - 1 )),
-  ?assertEqual( { 1, 2, 3 },            now_sub( { 2, 3, 3 }, ?M * ?M + ?M )),
-  ?assertEqual( { 1, 2, 3 },            now_sub( { 2, 1, 3 }, ?M * ?M - ?M )),
-  ?assertEqual( { 1, 2, 3 },            now_sub( { 2, 3, 4 }, ?M * ?M + ?M + 1 )),
-  ?assertEqual( { 0, 0, ?M - 1 },       now_sub( {0, 1, 0}, 1 )),
-  ?assertEqual( { 0, ?M - 1, 0 },       now_sub( {1, 0, 0}, ?M )),
-  ?assertEqual( { 0, ?M - 1, ?M - 1 },  now_sub( {1, 0, 0}, 1 )).
+  ?assertEqual( { 1, 2, 3 },            now_sub( { 1, 2, 4 }, 1 ) ),
+  ?assertEqual( { 1, 2, 3 },            now_sub( { 1, 3, 3 }, ?M ) ),
+  ?assertEqual( { 1, 2, 3 },            now_sub( { 1, 3, 4 }, ?M + 1 ) ),
+  ?assertEqual( { 1, 2, 3 },            now_sub( { 1, 3, 2 }, ?M - 1 ) ),
+  ?assertEqual( { 1, 2, 3 },            now_sub( { 2, 2, 3 }, ?M * ?M ) ),
+  ?assertEqual( { 1, 2, 3 },            now_sub( { 2, 2, 4 }, ?M * ?M + 1 ) ),
+  ?assertEqual( { 1, 2, 3 },            now_sub( { 2, 2, 2 }, ?M * ?M - 1 ) ),
+  ?assertEqual( { 1, 2, 3 },            now_sub( { 2, 3, 3 }, ?M * ?M + ?M ) ),
+  ?assertEqual( { 1, 2, 3 },            now_sub( { 2, 1, 3 }, ?M * ?M - ?M ) ),
+  ?assertEqual( { 1, 2, 3 },            now_sub( { 2, 3, 4 }, ?M * ?M + ?M + 1 ) ),
+  ?assertEqual( { 0, 0, ?M - 1 },       now_sub( { 0, 1, 0 }, 1 ) ),
+  ?assertEqual( { 0, ?M - 1, 0 },       now_sub( { 1, 0, 0 }, ?M ) ),
+  ?assertEqual( { 0, ?M - 1, ?M - 1 },  now_sub( { 1, 0, 0 }, 1 ) ).
+
+now_add_test() ->
+  ?assertEqual( { 1, 2, 3 },            now_add( { 1, 2, 2 }, 1 ) ),
+  ?assertEqual( { 1, 2, 3 },            now_add( { 1, 1, 3 }, ?M ) ),
+  ?assertEqual( { 1, 2, 3 },            now_add( { 0, 2, 3 }, ?M * ?M ) ),
+  ?assertEqual( { 2, 3, 4 },            now_add( { 1, 1, 1 }, ?M * ?M + ?M * 2 + 3 ) ),
+  ?assertEqual( { 0, 1, 0 },            now_add( { 0, 0, ?M - 1 }, 1 ) ),
+  ?assertEqual( { 1, 0, 0 },            now_add( { 0, ?M - 1, 0 }, ?M ) ).
 
 -endif. %% TEST
