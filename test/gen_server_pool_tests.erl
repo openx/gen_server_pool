@@ -55,6 +55,7 @@ t_cast( PoolId ) ->
   end,
   ?assertEqual( MsgCast, CastResponse ).
 
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 -define(TIMEOUT_POOL, timeout_pool).
 -define(TIMEOUT_MINPOOL, 2).
@@ -159,6 +160,8 @@ t_monitor( PoolId ) ->
   ?assertEqual( ?TIMEOUT_MAXPOOL - 1, proplists:get_value( size_monitor, Stats3 ) ).
 
 
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
 -define(AGE_AGE, 100).
 age_setup() ->
   PoolId = age_pool,
@@ -200,3 +203,44 @@ t_age( PoolId ) ->
   ?assertNotEqual( Pid2, Pid3 ),
   Stats5 = gen_server_pool:get_stats( PoolId ),
   ?assertEqual( 1, proplists:get_value( size, Stats5 ) ).
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+-define(IDLE_MINPOOL, 1).
+-define(IDLE_MAXPOOL, 4).
+-define(IDLE_IDLE, 100).
+idle_setup() ->
+  PoolId = idle_pool,
+  PoolOpts = [ { min_pool_size, ?IDLE_MINPOOL },
+               { max_pool_size, ?IDLE_MAXPOOL },
+               { max_worker_idle_ms, ?IDLE_IDLE } ],
+  gen_server_pool:start_link( { local, PoolId }, simple_server, [], [], PoolOpts),
+  PoolId.
+
+idle_test_() ->
+  { "Idle Tests",
+    inorder,
+    { setup, fun idle_setup/0, fun cleanup/1,
+      { with, [ fun t_idle/1
+              ] } } }.
+
+t_idle( PoolId ) ->
+  Stats1 = gen_server_pool:get_stats( PoolId ),
+  ?assertEqual( ?IDLE_MINPOOL, proplists:get_value( size, Stats1 ) ),
+  spawn_tasks( PoolId, 1, ?IDLE_MAXPOOL + 2, 40 ),
+  timer:sleep( 10 ),
+  Stats2 = gen_server_pool:get_stats( PoolId ),
+  ?assertEqual( ?IDLE_MAXPOOL, proplists:get_value( size, Stats2 ) ),
+  timer:sleep( 2 * ?IDLE_IDLE ),
+  Stats3 = gen_server_pool:get_stats( PoolId ),
+  ?assertEqual( ?IDLE_MINPOOL, proplists:get_value( size, Stats3 ) ),
+  Pid1 = gen_server:call( PoolId, { worker_pid, 0 } ),
+  timer:sleep( 2 * ?IDLE_IDLE ),
+  Stats4 = gen_server_pool:get_stats( PoolId ),
+  ?assertEqual( ?IDLE_MINPOOL, proplists:get_value( size, Stats4 ) ),
+  %% Even though more than max_worker_idle_ms has passed since the worker was
+  %% started, the worker is not killed because idle workers are only killed to
+  %% bring the pool size down to min_pool_size, and so the pid is still the
+  %% same.
+  Pid2 = gen_server:call( PoolId, { worker_pid, 0 } ),
+  ?assertEqual( Pid1, Pid2 ).
