@@ -1,3 +1,16 @@
+Version 2.4.0 David Hull (david.hull@openx.com)
+  * Fixed several bugs.
+  * When a new worker is started because a request is received when
+    all of the existing workers are busy, it is now started
+    asynchronously.
+  * Workers are now monitored, and so gen_server_pool notices more
+    quickly (and starts new workers if the pool size goes below the
+    minimum) if they exit.
+  * Allow some randomness to be added to max_worker_age_ms to prevent
+    workers from all dying at the same time.
+  * Added a gen_server_pool:stop interface to allow the pool to be
+    stopped.
+
 Version 2.3.0 Vikram Kadi(vikram.kadi@openx.com)
   * Added a new config parameter request_max_wait.
 
