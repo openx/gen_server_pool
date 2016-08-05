@@ -10,12 +10,15 @@
 
 -behaviour(gen_server).
 
+-include("gen_server_pool_internal.hrl").
+
 %% API
 -export([ start_link/4,
           start_link/5,
+          stop/1,
           get_stats/1,
           get_pool_pids/1,
-          available/4,
+          available/5,
           unavailable/2
         ]).
 
@@ -27,35 +30,54 @@
           terminate/2,
           code_change/3 ]).
 
+%% utilities
+-export([ now_add/2 ]).
+
+-define(M, 1000000).
+
+-type option() ::
+        { 'pool_id', atom() | string() } |
+        { 'prog_id', atom() | string() } |
+        { 'min_pool_size', non_neg_integer() } |
+        { 'max_pool_size', pos_integer() } |
+        { 'max_worker_age_ms', pos_integer() | { pos_integer(), pos_integer() } | { atom(), atom(), list() } | 'infinity' } |
+        { 'max_worker_idle_ms', pos_integer() | 'infinity' } |
+        { 'max_queued_requests', non_neg_integer() | 'infinity' } |
+        { 'max_request_wait_ms', pos_integer() | 'infinity' } |
+        { 'sup_max_r', non_neg_integer() } |
+        { 'sup_max_t', pos_integer() } |
+        { 'mondemand', term() }.
+-type options() :: list( option() ).
+
+-record(worker, { pid :: pid(),
+                  available_time :: erlang:timestamp(),
+                  end_time :: erlang:timestamp() | 'infinity' } ).
+
+-record(request, { call_args :: term(),
+                   arrival_time :: erlang:timestamp() }).
+
 -record(state, { proxy_ref,
                  sup_pid,
                  sup_max_r,
                  sup_max_t = 1,
-                 available = [],
-                 requests  = { [], [] },
-                 min_size  = 0,
-                 max_size  = 10,
-                 idle_secs = infinity,
-                 max_queued_tasks = infinity,
-                 num_queued_tasks = 0,
-                 num_dropped_tasks = 0,
-                 module,
+                 starter_ref :: gen_server_pool_starter:starter_ref(),
+                 available = [] :: list( #worker{} ),
+                 requests  = queue:new() :: queue:queue( #request{} ),
+                 min_pool_size  = 0 :: non_neg_integer(),
+                 max_pool_size  = 10 :: pos_integer(),
+                 max_worker_age_ms = infinity,
+                 max_worker_idle_ms = infinity,
+                 max_queued_requests = infinity,
+                 max_request_wait_ms = infinity,
+                 cur_pool_size = 0,
+                 num_queued_requests = 0,
+                 num_dropped_requests = 0,
+                 module :: atom(),
                  pool_id,
                  prog_id,
                  wm_size = 0,
                  wm_active = 0,
-                 wm_tasks = 0,
-                 max_worker_age = infinity,
-                 max_worker_wait = infinity
-                 }).
--record(worker, {
-          pid,
-          available_time,
-          start_time
-}).
-
--record(request, { call_args,
-                   arrival_time }).
+                 wm_requests = 0 }).
 
 %%====================================================================
 %% API
@@ -72,14 +94,17 @@ start_link( Name, Module, Args, Options, PoolOpts ) ->
                          [ Module, Args, Options, PoolOpts ],
                          Options ).
 
+stop( MgrPid ) ->
+  gen_server:call( MgrPid, stop ).
+
 get_stats( MgrPid ) ->
   gen_server:call( MgrPid, gen_server_pool_stats ).
 
-available( MgrPid, ProxyRef, WorkerPid, WorkerStartTime ) ->
+available( MgrPid, ProxyRef, WorkerPid, WorkerEndTime, Flags ) ->
   Worker = #worker{ pid = WorkerPid, 
                     available_time = os:timestamp(), 
-                    start_time = WorkerStartTime },
-  gen_server:cast( MgrPid, { ProxyRef, worker_available, Worker } ).
+                    end_time = WorkerEndTime },
+  gen_server:cast( MgrPid, { ProxyRef, worker_available, Worker, Flags } ).
 
 unavailable( MgrPid, WorkerPid ) ->
   gen_server:call( MgrPid, { unavailable, WorkerPid } ).
@@ -103,15 +128,17 @@ init( [ Module, Args, Options, PoolOpts ] ) ->
   S = parse_opts( PoolOpts, #state{ module = Module } ),
 
   % Get config from state
-  #state{ proxy_ref = ProxyRef, sup_max_r = MaxR, sup_max_t = MaxT } = S,
+  #state{ proxy_ref = ProxyRef, max_worker_age_ms = MaxWorkerAgeMS,
+          sup_max_r = MaxR, sup_max_t = MaxT } = S,
 
   % Start supervisor for pool members
-  { ok, SupPid } = gen_server_pool_sup:start_link( self(), ProxyRef,
+  { ok, SupPid } = gen_server_pool_sup:start_link( self(), ProxyRef, MaxWorkerAgeMS,
                                                    Module, Args, Options,
                                                    MaxR, MaxT ),
+  { ok, StarterRef } = gen_server_pool_starter:start_link( SupPid, [] ),
 
   % schedule periodic processing and start workers
-  setup_schedule( S#state{ sup_pid = SupPid }, PoolOpts ).
+  setup_schedule( S#state{ sup_pid = SupPid, starter_ref = StarterRef }, PoolOpts ).
 
 
 %%--------------------------------------------------------------------
@@ -131,14 +158,15 @@ handle_call( get_pool_pids, _From, State = #state{ sup_pid = SupPid } ) ->
   { reply, {ok, Children}, State };
 
 handle_call( {unavailable, Pid}, _From, State ) ->
-  NState = worker_unavailable( Pid, State ),
-  { reply, {ok, Pid}, NState };
+  NewState = worker_unavailable( Pid, State ),
+  { reply, {ok, Pid}, NewState };
+
+handle_call( stop, _From, State ) ->
+  { stop, normal, ok, State };
 
 handle_call( Call, From, State ) ->
-  case handle_request ({ '$gen_call', From, Call }, State) of
-    {ok, NewState} -> { noreply, NewState };
-    {Error, NewState} -> {reply, Error, NewState}
-  end.
+  NewState = handle_request( { '$gen_call', From, Call }, State ),
+  { noreply, NewState }.
 
 %%--------------------------------------------------------------------
 %% Function: handle_cast(Msg, State) -> {noreply, State} |
@@ -146,13 +174,13 @@ handle_call( Call, From, State ) ->
 %%                                      {stop, Reason, State}
 %% Description: Handling cast messages
 %%--------------------------------------------------------------------
-handle_cast( { ProxyRef, worker_available, Worker=#worker{} },
+handle_cast( { ProxyRef, worker_available, Worker=#worker{}, Flag },
              State = #state{ proxy_ref = ProxyRef } ) ->
-  {_, NewState} = worker_available (Worker, State),
-  {noreply, NewState};
+  NewState = worker_available( Worker, Flag, State ),
+  { noreply, NewState };
 
 handle_cast( Cast, State ) ->
-  { _, NewState } = handle_request ({'$gen_cast', Cast }, State ),
+  NewState = handle_request( { '$gen_cast', Cast }, State ),
   { noreply, NewState }.
 
 %%--------------------------------------------------------------------
@@ -175,11 +203,16 @@ handle_info( { ProxyRef, collect_stats },
 
 handle_info( { ProxyRef, check_idle_timeouts },
              #state{ proxy_ref = ProxyRef } = State ) ->
+  NewState = check_idle_timeouts( State ),
   schedule_idle_check( State ),
-  { noreply, check_idle_timeouts( State ) }; 
+  { noreply, NewState };
+
+handle_info( { 'DOWN', _MonitorRef, process, Pid, _Info }, State ) ->
+  NewState = demonitor_worker( State, Pid ),
+  { noreply, NewState };
 
 handle_info( Info, State ) ->
-  { _, NewState } = handle_request (Info, State ),
+  NewState = handle_request( Info, State ),
   { noreply, NewState }.
 
 %%--------------------------------------------------------------------
@@ -189,8 +222,11 @@ handle_info( Info, State ) ->
 %% cleaning up. When it returns, the gen_server terminates with Reason.
 %% The return value is ignored.
 %%--------------------------------------------------------------------
-terminate( Reason, State ) ->
-  terminate_pool( Reason, State ),
+terminate( _Reason, #state{ starter_ref = StarterRef } ) ->
+  %% FIXME: The gen_server_pool_sup is linked, and so it will exit
+  %% automatically, but we need to kill the gen_server_pool_starter.  It would
+  %% be better to use a proper supervision tree.
+  gen_server_pool_starter:stop( StarterRef ),
   ok.
 
 %%--------------------------------------------------------------------
@@ -203,64 +239,49 @@ code_change( _OldVsn, State, _Extra ) ->
 %%--------------------------------------------------------------------
 %%% Internal functions
 %%--------------------------------------------------------------------
-handle_request( Req, State = #state{ requests = { Push, Pop },
-                                     num_queued_tasks=NumTasks } ) ->
-  do_work( State#state{ requests = { [ timestamped_request(Req) | Push ], Pop },
-                        num_queued_tasks=NumTasks+1} ).
 
 timestamped_request(Req) ->
   #request{call_args=Req, arrival_time=os:timestamp()}.
 
-worker_available( Worker = #worker{ pid = Pid }, 
-                  State = #state{ available = Workers } ) ->
-  % If a child sent a message to itself then it could already be in the list
-  case proplists:is_defined( Pid, Workers ) of
-    true  -> do_work( State );
-    false -> do_work( State#state{ available = [ Worker | Workers ] } )
-  end.
-
-
-worker_unavailable( Pid, State = #state{ available = Workers } ) ->
-  State#state{ available = proplists:delete( Pid, Workers ) }.
-
-stats( #state{ sup_pid   = SupPid,
+stats( #state{ starter_ref = StarterRef,
                available = Workers,
                wm_size = WmSize, 
                wm_active = WmActive, 
-               wm_tasks = WmTasks,
-               num_queued_tasks = NumTasks,
-               num_dropped_tasks = NumDroppedTasks
+               wm_requests = WmRequests,
+               cur_pool_size = CurPoolSize,
+               num_queued_requests = NumQueuedRequests,
+               num_dropped_requests = NumDroppedRequests
                } ) ->
-  Size   = proplists:get_value( active, supervisor:count_children( SupPid ) ),
+  Size   = gen_server_pool_starter:worker_count( StarterRef ),
   Idle   = length( Workers ),
   Active = Size - Idle,
   WmIdle = WmSize - WmActive,
   [ { size, Size },
+    { size_monitor, CurPoolSize },
     { active, Active },
     { idle, Idle },
-    { tasks, NumTasks },
-    { wmsize, WmSize},
-    { wmactive, WmActive},
-    { wmidle, WmIdle},
-    { wmtasks, WmTasks},
-    { drops, NumDroppedTasks}
+    { tasks, NumQueuedRequests },
+    { wmsize, WmSize },
+    { wmactive, WmActive },
+    { wmidle, WmIdle },
+    { wmtasks, WmRequests },
+    { drops, NumDroppedRequests }
   ].
 
-collect_stats ( State = #state{ sup_pid = SupPid,
+collect_stats ( State = #state{ starter_ref = StarterRef,
                                 available = Workers,
-                                wm_size = WmSize, wm_active = WmActive, 
-                                wm_tasks = WmTasks,
-                                num_queued_tasks=NumTasks } ) ->
-  Size   = proplists:get_value( active, supervisor:count_children( SupPid ) ),
+                                num_queued_requests = NumQueuedRequests,
+                                wm_size = WmSize,
+                                wm_active = WmActive,
+                                wm_requests = WmRequests } ) ->
+  Size   = gen_server_pool_starter:worker_count( StarterRef ),
   Idle   = length( Workers ),
   Active = Size - Idle,
-  Tasks  = NumTasks,
 
-  NewWmSize = max (Size,WmSize),
-  NewWmActive = max (Active, WmActive),
-  NewWmTasks = max (Tasks, WmTasks),
-
-  State#state{wm_size = NewWmSize, wm_active = NewWmActive, wm_tasks = NewWmTasks}.
+  State#state{
+    wm_size = max( Size, WmSize ),
+    wm_active = max( Active, WmActive ),
+    wm_requests = max( NumQueuedRequests, WmRequests ) }.
 
 emit_stats( #state{ prog_id = ProgId, pool_id = PoolId } = S ) ->
   N = fun( K ) -> 
@@ -278,157 +299,299 @@ emit_stats( #state{ prog_id = ProgId, pool_id = PoolId } = S ) ->
   S#state{
      wm_size = 0,
      wm_active = 0,
-     wm_tasks = 0,
-     num_dropped_tasks=0
-  }.
+     wm_requests = 0,
+     num_dropped_requests = 0 }.
 
-terminate_pool( _Reason, _State ) ->
-  ok.
 
-do_work( State = #state{ requests  = { [], [] } } ) ->
-  % No requests - do nothing.
-  {ok, State};
+-spec handle_request(term(), #state{}) -> #state{}.
+%% Handle a gen_server call, cast, or info request by proxying it to a
+%% gen_server_pool_proxy worker.
+handle_request( Request, State ) ->
+  State1 = check_for_worker( State ),
+  State2 = time_out_requests( State1 ),
+  State3 = enqueue_request( State2, Request ),
+  do_work( State3 ).
 
-do_work( State = #state{ available = [],
-                         requests  = { Push, [ _ | Pop ] },
-                         max_size  = MaxSize,
-                         sup_pid   = SupPid,
-                         num_queued_tasks = NumTasks,
-                         num_dropped_tasks = DroppedTasks,
-                         max_queued_tasks = MaxTasks
-                 } ) ->
-  % Requests, but no workers - check if we can start a worker.
-  PoolSize = proplists:get_value( active, supervisor:count_children( SupPid ) ),
-  case PoolSize < MaxSize of
-    true  ->
-      gen_server_pool_sup:add_child( SupPid ),
-      {ok, State};
-    false -> 
-      % we are at max pool size, so allow queuing to occur
-      case MaxTasks =/= infinity andalso NumTasks > MaxTasks of
-        true ->
-          % queue too big, so drop the request
-          { {error, request_dropped },
-            State#state {
-              requests = {Push, Pop},
-              num_queued_tasks = NumTasks - 1,
-              num_dropped_tasks = DroppedTasks + 1
-            }
-          };
-        false ->
-          { ok, State }
-      end
-  end;
+-spec worker_available(#worker{}, Flag::non_neg_integer(), #state{}) -> #state{}.
+%% Return a gen_server_pool_proxy worker to the pool.
+worker_available( Worker, Flag, State ) ->
+  State1 = monitor_worker_if_initial( State, Worker, Flag ),
+  State2 = return_worker_to_pool( State1, Worker ),
+  State3 = time_out_requests( State2 ),
+  do_work( State3 ).
 
-do_work( State = #state{ requests  = { Push, [] } } ) ->
-  do_work( State#state{ requests = { [], lists:reverse( Push ) } } );
+-spec worker_unavailable(pid(), #state{}) -> #state{}.
+%% Remove a gen_server_pool_proxy worker from the pool.  This function should
+%% not normally be called.
+worker_unavailable( Pid, State = #state{ available = Workers } ) ->
+  State#state{ available = lists:keydelete( Pid, #worker.pid, Workers ) }.
 
-do_work( State = #state{ proxy_ref = ProxyRef,
-                         available = [ #worker{ pid = Pid, start_time = WorkerStartTime } | Workers ],
-                         requests  = { Push, [ Req=#request{call_args=CallArgs={_, From, _}}  | Pop ] },
-                         num_queued_tasks = NumTasks,
-                         max_worker_age = MaxWorkerAge }) ->
-  case request_past_deadline(Req, State) of
-    true -> gen_server:reply(From, {error, request_timeout}),
-            {ok, State#state{ available = Workers,
-                              requests  = { Push, Pop},
-                              num_queued_tasks=NumTasks-1}}; 
+
+-spec do_work(#state{}) -> #state{}.
+do_work( State = #state{ num_queued_requests = 0 } ) ->
+  %% No requests -- do nothing.
+  State;
+
+do_work( State = #state{ available = [] } ) ->
+  %% No workers -- do nothing.
+  State;
+
+do_work( State = #state{ available = [ #worker{ pid = Pid } | Workers ],
+                         requests = Requests,
+                         num_queued_requests = NumQueuedRequests } ) ->
+  { { value, #request{ call_args = CallArgs } }, RequestsOut } = queue:out( Requests ),
+  case is_process_alive( Pid ) of
     false ->
-      case is_process_alive(Pid) of
-        false ->
-          do_work( State#state{ available = Workers } );
-        true  ->
-          %% Check worker age here, and boot it if too old
-          case worker_too_old(WorkerStartTime, MaxWorkerAge) of
-            true ->
-              % Kill the old worker, and check the min pool size
-              gen_server_pool_proxy:stop( Pid, ProxyRef ),
-              assure_min_pool_size( State ),
-              do_work( State#state { available = Workers } );
-            false ->
-              erlang:send( Pid, CallArgs, [noconnect] ),
-              {ok, State#state{ available = Workers,
-                                requests  = { Push, Pop },
-                                num_queued_tasks=NumTasks-1}
-              }
-           end
-      end
-   end.
-
-request_past_deadline( _, #state{max_worker_wait=infinity} ) -> false;
-request_past_deadline( #request{arrival_time=BeginTime},
-    #state{max_worker_wait=MaxTimeInMillis} ) ->
-  ElapsedTime=(timer:now_diff(os:timestamp(), BeginTime) / 1000),
-  ElapsedTime >= MaxTimeInMillis.
-
-worker_too_old (_WorkerStartTime, infinity) ->
-  false;
-worker_too_old (WorkerStartTime, MaxWorkerAge) ->
-  Now = os:timestamp(),
-  WorkerAge = seconds_between( Now, WorkerStartTime ),
-  WorkerAge >= MaxWorkerAge.
-
-assure_min_pool_size( #state{ min_size = MinSize, sup_pid = SupPid } = S ) ->
-  PoolSize = proplists:get_value( active, supervisor:count_children( SupPid ) ),
-  add_children( MinSize - PoolSize, S ).
-
-
-add_children( N, #state{} ) when N =< 0 ->
-  ok;
-add_children( N, #state{ sup_pid = SupPid } = S ) ->
-  case gen_server_pool_sup:add_child( SupPid ) of
-    { error, Error } -> Error;
-    _                -> add_children( N-1, S )
+      %% The first worker in the available stack may have died between when it
+      %% was checked in check_for_worker and now.
+      do_work( State#state{ available = Workers } );
+    true  ->
+      erlang:send( Pid, CallArgs, [noconnect] ),
+      State#state{ available = Workers,
+                   requests  = RequestsOut,
+                   num_queued_requests = NumQueuedRequests - 1 }
   end.
 
 
-schedule_idle_check( #state{ idle_secs = infinity } = S ) ->
-  S;
-schedule_idle_check( #state{ proxy_ref = ProxyRef,
-                             idle_secs = IdleSecs } = S ) ->
-  erlang:send_after( IdleSecs * 1000, self(), { ProxyRef, check_idle_timeouts } ),
-  S.
+ensure_min_pool_size( #state{ starter_ref = StarterRef, min_pool_size = MinPoolSize }, Synchronicity ) ->
+  gen_server_pool_starter:ensure_min_workers( StarterRef, MinPoolSize, Synchronicity ).
+
+
+schedule_idle_check( #state{ max_worker_idle_ms = infinity } ) -> ok;
+schedule_idle_check( #state{ proxy_ref = ProxyRef, max_worker_idle_ms = MaxWorkerIdleMS } ) ->
+  erlang:send_after( MaxWorkerIdleMS, self(), { ProxyRef, check_idle_timeouts } ).
 
 
 check_idle_timeouts( #state{ available = [] } = S ) ->
   S;
 check_idle_timeouts( #state{ proxy_ref = ProxyRef,
-                             sup_pid = SupPid,
-                             idle_secs = IdleSecs,
+                             starter_ref = StarterRef,
+                             max_worker_idle_ms = MaxWorkerIdleMS,
                              available = Available,
-                             min_size = MinSize } = S ) ->
-  PoolSize = proplists:get_value( active, supervisor:count_children( SupPid ) ),
-  MaxWorkersToKill = PoolSize - MinSize,
-  Survivors = kill_idle_workers (ProxyRef,IdleSecs,Available, [], MaxWorkersToKill),
+                             min_pool_size = MinPoolSize } = S ) ->
+  Survivors0 = kill_aged_workers( ProxyRef, os:timestamp(), Available, [] ),
+
+  PoolSize = gen_server_pool_starter:worker_count( StarterRef ),
+  MaxWorkersToKill = PoolSize - MinPoolSize,
+  MaxIdleTimeKill = now_sub( os:timestamp(), MaxWorkerIdleMS * 1000 ),
+  Survivors = kill_idle_workers( ProxyRef, MaxIdleTimeKill, Survivors0, [], MaxWorkersToKill ),
 
   State = S#state{ available = Survivors },
-  assure_min_pool_size( State ),
+  ensure_min_pool_size( State, async ),
 
   State.
 
-kill_idle_workers(_ProxyRef,_IdleSecs,Available, Survivors, MaxWorkersToKill)  when MaxWorkersToKill =< 0 ->
-  Available ++ Survivors;
-kill_idle_workers(_ProxyRef,_IdleSecs,[], Survivors, _MaxWorkersToKill) ->
-  Survivors;
-kill_idle_workers(ProxyRef,IdleSecs,[Worker=#worker{pid=Pid,available_time=Time} | Available], Survivors, MaxWorkersToKill) ->
-  Now = os:timestamp(),
-  IdleTime = seconds_between( Now, Time ),
-  case IdleTime >= IdleSecs of
+
+%% Checks the worker pool for an available worker.  If none is found, and the
+%% total number of workers is less than the maximum, starts a new worker.
+%% Returns the updated state.
+check_for_worker( State = #state{ available = Available } ) ->
+  AvailableOut = check_for_worker_do( State, os:timestamp(), Available ),
+  State#state{ available = AvailableOut }.
+
+check_for_worker_do( State = #state{ proxy_ref = ProxyRef }, Now,
+                     Available = [ Worker = #worker{ pid = Pid } | RemainingWorkers ] ) ->
+  case is_process_alive( Pid ) of
+    false     ->
+      %% Worker is dead; drop it and try again.
+      check_for_worker_do( State, Now, RemainingWorkers );
     true ->
-      case is_process_alive(Pid) of
-        false -> kill_idle_workers(ProxyRef,IdleSecs, Available, Survivors, MaxWorkersToKill);
+      case worker_too_old( Worker, Now ) of
         true ->
+          %% Worker is alive, but too old; kill it and try again.
           gen_server_pool_proxy:stop( Pid, ProxyRef ),
-          kill_idle_workers(ProxyRef,IdleSecs, Available, Survivors, MaxWorkersToKill-1)
-      end;
-    false ->
-      kill_idle_workers(ProxyRef,IdleSecs, Available, [ Worker | Survivors], MaxWorkersToKill)
+          check_for_worker_do( State, Now, RemainingWorkers );
+        false ->
+          %% Worker is alive and not too old; return.
+          Available
+      end
+  end;
+check_for_worker_do( #state{ starter_ref = StarterRef, min_pool_size = MinPoolSize, max_pool_size = MaxPoolSize },
+                     _Now, [] ) ->
+  %% No workers are available.  If the total number of workers is less than
+  %% the maximum, start a new one.
+  gen_server_pool_starter:add_worker( StarterRef, MinPoolSize, MaxPoolSize, async ),
+  [].
+
+
+monitor_worker_if_initial( State = #state{ cur_pool_size = CurPoolSize }, #worker{ pid = Pid }, Flag ) ->
+  if Flag band ?GSP_FLAG_INITIAL =:= 0 ->
+      State;
+     true ->
+      monitor( process, Pid ),
+      State#state{ cur_pool_size = CurPoolSize + 1 }
   end.
 
-seconds_between( { MS1, S1, _ }, { MS1, S2, _ } ) ->
-  S1 - S2;
-seconds_between( { MS1, S1, _ }, { MS2, S2, _ } ) ->
-  ( MS1 * 1000000 + S1 ) - ( MS2 * 1000000 + S2 ).
+demonitor_worker( State = #state{ available = Available, cur_pool_size = CurPoolSize }, Pid ) ->
+  Available1 = remove_worker_from_available( Available, Pid ),
+  State#state{ available = Available1, cur_pool_size = CurPoolSize - 1 }.
+
+remove_worker_from_available( [ FirstAvailable = #worker{ pid = WorkerPid } | RestAvailable ], DeadPid ) ->
+  if WorkerPid =:= DeadPid -> RestAvailable;
+     true                  -> [ FirstAvailable | remove_worker_from_available( RestAvailable, DeadPid ) ]
+  end;
+remove_worker_from_available( [], _DeadPid ) ->
+  [].
+
+
+%% Returns a worker to the pool, unless it is too old, in which case it is
+%% killed.
+return_worker_to_pool( State = #state{ proxy_ref = ProxyRef, available = Available }, Worker = #worker{ pid = Pid } ) ->
+  case worker_too_old( Worker, os:timestamp() ) of
+    true ->
+      %% The worker is too old; kill it.
+      gen_server_pool_proxy:stop( Pid, ProxyRef ),
+      ensure_min_pool_size( State, async ),
+      State;
+    false ->
+      %% If a child sent a message to itself then it could already be in the list.
+      case lists:keyfind( Pid, #worker.pid, Available ) of
+        false -> State#state{ available = [ Worker | Available ] };
+        _     -> State
+      end
+  end.
+
+
+time_out_requests( State = #state{ requests = Requests,
+                                   num_queued_requests = NumQueuedRequests,
+                                   num_dropped_requests = NumDroppedRequests } ) ->
+  RequestTimeoutTime = request_timeout_time( State ),
+  { Requests1, NumQueuedRequests1, NumDroppedRequests1 } =
+    time_out_requests_do( Requests, NumQueuedRequests, NumDroppedRequests, RequestTimeoutTime ),
+  State#state{ requests = Requests1, num_queued_requests = NumQueuedRequests1, num_dropped_requests = NumDroppedRequests1 }.
+
+time_out_requests_do( Requests, NumQueuedRequests, NumDroppedRequests, RequestTimeoutTime ) ->
+  case queue:peek( Requests ) of
+    empty ->
+      { Requests, NumQueuedRequests, NumDroppedRequests };
+    { value, Request = #request{ call_args = CallArgs } } ->
+      case request_too_old( Request, RequestTimeoutTime ) of
+        true ->
+          case CallArgs of
+            { '$gen_call', From, _ } ->
+              gen_server:reply( From, { error, request_timeout } );
+            _ -> %% cast or info.
+              ok
+          end,
+          time_out_requests_do( queue:drop( Requests ), NumQueuedRequests - 1, NumDroppedRequests + 1, RequestTimeoutTime );
+        false -> { Requests, NumQueuedRequests, NumDroppedRequests }
+      end
+  end.
+
+
+enqueue_request( State = #state{ requests = Requests,
+                                 max_queued_requests = MaxQueuedRequests,
+                                 num_queued_requests = NumQueuedRequests,
+                                 num_dropped_requests = NumDroppedRequests },
+                 Request ) ->
+
+
+  { Requests2, NumQueuedRequests2, NumDroppedRequests2 } =
+    if NumQueuedRequests =:= 0 orelse NumQueuedRequests < MaxQueuedRequests ->
+        { Requests, NumQueuedRequests, NumDroppedRequests };
+       true ->
+        { { value, #request{ call_args = CallArgs } }, Requests1 } = queue:out( Requests ),
+        case CallArgs of
+          { '$gen_call', From, _ } ->
+            gen_server:reply( From, { error, request_dropped } );
+          _ -> %% cast or info.
+            ok
+        end,
+        { Requests1, NumQueuedRequests - 1, NumDroppedRequests + 1 }
+    end,
+  State#state{ requests = queue:in( timestamped_request( Request ), Requests2 ),
+               num_queued_requests = NumQueuedRequests2 + 1,
+               num_dropped_requests = NumDroppedRequests2 }.
+
+
+
+%% Enforce max_worker_age and prune the worker list of dead processes.  This
+%% function reverses the order of the worker list; it will be reversed again
+%% by kill_idle_workers.  maintaining the order of the worker list.
+kill_aged_workers( _ProxyRef, _Now, [], Survivors ) ->
+  Survivors;
+kill_aged_workers( ProxyRef, Now, [ Worker = #worker{ pid = Pid } | Available ], Survivors ) ->
+  case is_process_alive( Pid ) of
+    false     -> kill_aged_workers( ProxyRef, Now, Available, Survivors );                 % Worker is dead; drop it.
+    true ->
+      case worker_too_old( Worker, Now ) of
+        true  -> gen_server_pool_proxy:stop( Pid, ProxyRef ),                                   % Worker is alive, but too old; kill it.
+                 kill_aged_workers( ProxyRef, Now, Available, Survivors );
+        false -> kill_aged_workers( ProxyRef, Now, Available, [ Worker | Survivors ] )     % Worker is alive and not too old; keep it.
+      end
+  end.
+
+%% Kill up to MaxWorkersToKill workers that have not been active since
+%% KillTime.
+%%
+%% We would prefer to kill the oldest workers, because those would be the
+%% first to be killed by kill_aged_workers.  We could do that by using a heap
+%% to track the MaxWorkersToKill oldest workers, but that is not implemented
+%% here.  Instead, we use the reversed worker list returned by
+%% kill_aged_workers; the workers that have been idle the longest are at the
+%% beginning of thise list, and we hope idle time is a weak proxy for age.
+%% This function reverses the order of the list again, meaning that the
+%% combination of kill_aged_workers and kill_idle_workers will leave the list
+%% in the original order.
+kill_idle_workers( _ProxyRef, _TimeKill, Available, Survivors, MaxWorkersToKill) when MaxWorkersToKill =< 0 ->
+  lists:reverse( Survivors, Available );
+kill_idle_workers( _ProxyRef, _TimeKill, [], Survivors, _MaxWorkersToKill) ->
+  lists:reverse( Survivors );
+kill_idle_workers( ProxyRef, TimeKill, [ Worker = #worker{ pid = Pid, available_time = IdleTime } | Available ], Survivors, MaxWorkersToKill ) ->
+  case timer:now_diff( TimeKill, IdleTime ) > 0 of
+    true  -> gen_server_pool_proxy:stop( Pid, ProxyRef ),                                               % Worker has been idle too long; kill it.
+             kill_idle_workers( ProxyRef, TimeKill, Available, Survivors, MaxWorkersToKill - 1 );
+    false -> kill_idle_workers( ProxyRef, TimeKill, Available, [ Worker | Survivors], MaxWorkersToKill )% Worker is ok; keep it.
+  end.
+
+
+request_timeout_time( #state{ max_request_wait_ms = infinity } ) ->
+  undefined;
+request_timeout_time( #state{ max_request_wait_ms = MaxRequestWaitMS } ) ->
+  now_sub( os:timestamp(), MaxRequestWaitMS * 1000 ).
+
+
+worker_too_old( #worker{ end_time = infinity }, _Now ) ->
+  false;
+worker_too_old( #worker{ end_time = EndTime }, Now ) ->
+  timer:now_diff( Now, EndTime ) > 0.
+
+
+request_too_old( _Request, undefined ) ->
+  false;
+request_too_old( #request{ arrival_time = ArrivalTime }, RequestTimeoutTime ) ->
+  timer:now_diff( RequestTimeoutTime, ArrivalTime ) > 0.
+
+
+now_sub( { Megas, Secs, Micros }, SubMicros ) ->
+  SubMicros0 = SubMicros rem ?M,
+  SubSecs0 = SubMicros div ?M,
+  {MicrosOut, SubSecs1} =
+    case Micros - SubMicros0 of
+      MicrosOut0 when MicrosOut0 >= 0 -> {MicrosOut0, SubSecs0};
+      MicrosOut0                      -> {MicrosOut0 + ?M, SubSecs0 + 1}
+    end,
+  SubSecs2 = SubSecs1 rem ?M,
+  SubMegas2 = SubSecs1 div ?M,
+  {SecsOut, SubMegas3} =
+    case Secs - SubSecs2 of
+      SecsOut0 when SecsOut0 >= 0 -> {SecsOut0, SubMegas2};
+      SecsOut0                    -> {SecsOut0 + ?M, SubMegas2 + 1}
+    end,
+  {Megas - SubMegas3, SecsOut, MicrosOut}.
+
+now_add( { Megas, Secs, Micros }, AddMicros ) when is_integer(AddMicros), AddMicros >= 0 ->
+  Micros0 = Micros + AddMicros,
+  if Micros0 < ?M                            -> { Megas, Secs, Micros0 };
+     true ->
+      Micros1 = Micros0 rem ?M,
+      Secs1 = Secs + Micros0 div ?M,
+      if Secs1 < ?M                          -> { Megas, Secs1, Micros1 };
+         true ->
+          Secs2 = Secs1 rem ?M,
+          Megas2 = Megas + Secs1 div ?M,        { Megas2, Secs2, Micros1 }
+      end
+  end.
 
 
 schedule_emit_stats( #state{ prog_id = undefined } ) ->
@@ -445,6 +608,7 @@ schedule_collect_stats( #state{ proxy_ref = ProxyRef } ) ->
   % collect stats every 10 second.
   erlang:send_after( 1*1000, self(), { ProxyRef, collect_stats } ).
 
+-spec parse_opts(options(), #state{}) -> #state{}.
 parse_opts( [], State ) ->
   finalize( State );
 parse_opts( [ { pool_id, V } | Opts ], State ) when is_atom( V ) ->
@@ -453,28 +617,44 @@ parse_opts( [ { pool_id, V } | Opts ], State ) ->
   parse_opts( Opts, State#state{ pool_id = V } );
 parse_opts( [ { prog_id, V } | Opts ], State ) ->
   parse_opts( Opts, State#state{ prog_id = V } );
-parse_opts( [ { min_pool_size, V } | Opts ], State ) ->
-  parse_opts( Opts, State#state{ min_size = V } );
-parse_opts( [ { max_pool_size, V } | Opts ], State ) ->
-  parse_opts( Opts, State#state{ max_size = V } );
-parse_opts( [ { idle_timeout, V } | Opts ], State ) ->
-  parse_opts( Opts, State#state{ idle_secs = V } );
-parse_opts( [ { max_queue, V } | Opts ], State ) ->
-  parse_opts( Opts, State#state{ max_queued_tasks = V } );
-parse_opts( [ { max_worker_age, V } | Opts ], State ) ->
-  parse_opts( Opts, State#state{ max_worker_age = V } );
-parse_opts( [ { sup_max_r, V } | Opts ], State ) ->
+parse_opts( [ { min_pool_size, V } | Opts ], State ) when is_integer(V), V >= 0 ->
+  parse_opts( Opts, State#state{ min_pool_size = V } );
+parse_opts( [ { max_pool_size, V } | Opts ], State ) when is_integer(V), V >= 1 ->
+  parse_opts( Opts, State#state{ max_pool_size = V } );
+parse_opts( [ { max_worker_age_ms, V } | Opts ], State ) when is_integer(V), V >= 1; V =:= 'infinity' ->
+  parse_opts( Opts, State#state{ max_worker_age_ms = V } );
+parse_opts( [ { max_worker_age_ms, V = { MaxAgeMS, JitterMS } } | Opts ], State )
+  when is_integer(MaxAgeMS), MaxAgeMS > 1, is_integer(JitterMS), JitterMS > 0 ->
+  parse_opts( Opts, State#state{ max_worker_age_ms = V } );
+parse_opts( [ { max_worker_age_ms, V = { Module, Function, Args } } | Opts ], State )
+  when is_atom(Module), is_atom(Function), is_list(Args) ->
+  parse_opts( Opts, State#state{ max_worker_age_ms = V } );
+parse_opts( [ { max_worker_idle_ms, V } | Opts ], State ) when is_integer(V), V >= 1; V =:= 'infinity' ->
+  parse_opts( Opts, State#state{ max_worker_idle_ms = V } );
+parse_opts( [ { max_queued_requests, V } | Opts ], State ) when is_integer(V), V >= 0; V =:= 'infinity' ->
+  parse_opts( Opts, State#state{ max_queued_requests = V } );
+parse_opts( [ { max_request_wait_ms, V } | Opts ], State ) when is_integer(V), V >= 1; V =:= 'infinity' ->
+  parse_opts( Opts, State#state{ max_request_wait_ms = V } );
+parse_opts( [ { sup_max_r, V } | Opts ], State ) when is_integer(V), V >= 0 ->
   parse_opts( Opts, State#state{ sup_max_r = V } );
-parse_opts( [ { sup_max_t, V } | Opts ], State ) ->
+parse_opts( [ { sup_max_t, V } | Opts ], State ) when is_integer(V), V >= 1 ->
   parse_opts( Opts, State#state{ sup_max_t = V } );
-parse_opts( [ { request_max_wait, V } | Opts ], State ) ->
-  parse_opts( Opts, State#state{ max_worker_wait = V } );
 parse_opts( [ { mondemand, _ } | Opts ], State ) ->
   % stats option is not set in state
-  parse_opts( Opts, State ).
+  parse_opts( Opts, State );
+%% Deprecated options names.
+parse_opts( [ { max_queue, V } | Opts ], State ) when is_integer(V), V >= 0; V =:= 'infinity' ->
+  parse_opts( Opts, State#state{ max_queued_requests = V } );
+parse_opts( [ { idle_timeout, V } | Opts ], State ) when is_integer(V), V >= 1; V =:= 'infinity' ->
+  parse_opts( Opts, State#state{ max_worker_idle_ms = V * 1000 } );
+parse_opts( [ { max_worker_age, V } | Opts ], State ) when is_integer(V), V >= 1; V =:= 'infinity' ->
+  parse_opts( Opts, State#state{ max_worker_age_ms = V  * 1000 } );
+parse_opts( [ { request_max_wait, V } | Opts ], State ) when is_integer(V), V >= 1; V =:= 'infinity' ->
+  parse_opts( Opts, State#state{ max_request_wait_ms = V } ).
 
 
-finalize( #state{ sup_max_r = undefined, max_size = Sz } = S ) ->
+
+finalize( #state{ sup_max_r = undefined, max_pool_size = Sz } = S ) ->
   % Set max_r to max pool size if not set
   finalize( S#state{ sup_max_r = Sz } );
 finalize( State ) ->
@@ -493,7 +673,7 @@ setup_schedule( State, PoolOpts ) ->
   end,
 
   % start min_pool_size workers and schedule idle time check
-  case assure_min_pool_size( State ) of
+  case ensure_min_pool_size( State, sync ) of
     ok ->
       schedule_idle_check( State ),
       { ok, State };
@@ -507,4 +687,27 @@ setup_schedule( State, PoolOpts ) ->
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
--endif.
+now_sub_test() ->
+  ?assertEqual( { 1, 2, 3 },            now_sub( { 1, 2, 4 }, 1 ) ),
+  ?assertEqual( { 1, 2, 3 },            now_sub( { 1, 3, 3 }, ?M ) ),
+  ?assertEqual( { 1, 2, 3 },            now_sub( { 1, 3, 4 }, ?M + 1 ) ),
+  ?assertEqual( { 1, 2, 3 },            now_sub( { 1, 3, 2 }, ?M - 1 ) ),
+  ?assertEqual( { 1, 2, 3 },            now_sub( { 2, 2, 3 }, ?M * ?M ) ),
+  ?assertEqual( { 1, 2, 3 },            now_sub( { 2, 2, 4 }, ?M * ?M + 1 ) ),
+  ?assertEqual( { 1, 2, 3 },            now_sub( { 2, 2, 2 }, ?M * ?M - 1 ) ),
+  ?assertEqual( { 1, 2, 3 },            now_sub( { 2, 3, 3 }, ?M * ?M + ?M ) ),
+  ?assertEqual( { 1, 2, 3 },            now_sub( { 2, 1, 3 }, ?M * ?M - ?M ) ),
+  ?assertEqual( { 1, 2, 3 },            now_sub( { 2, 3, 4 }, ?M * ?M + ?M + 1 ) ),
+  ?assertEqual( { 0, 0, ?M - 1 },       now_sub( { 0, 1, 0 }, 1 ) ),
+  ?assertEqual( { 0, ?M - 1, 0 },       now_sub( { 1, 0, 0 }, ?M ) ),
+  ?assertEqual( { 0, ?M - 1, ?M - 1 },  now_sub( { 1, 0, 0 }, 1 ) ).
+
+now_add_test() ->
+  ?assertEqual( { 1, 2, 3 },            now_add( { 1, 2, 2 }, 1 ) ),
+  ?assertEqual( { 1, 2, 3 },            now_add( { 1, 1, 3 }, ?M ) ),
+  ?assertEqual( { 1, 2, 3 },            now_add( { 0, 2, 3 }, ?M * ?M ) ),
+  ?assertEqual( { 2, 3, 4 },            now_add( { 1, 1, 1 }, ?M * ?M + ?M * 2 + 3 ) ),
+  ?assertEqual( { 0, 1, 0 },            now_add( { 0, 0, ?M - 1 }, 1 ) ),
+  ?assertEqual( { 1, 0, 0 },            now_add( { 0, ?M - 1, 0 }, ?M ) ).
+
+-endif. %% TEST

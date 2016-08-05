@@ -11,23 +11,23 @@
 
 -behaviour(supervisor).
 
--export([ start_link/7,
+-export([ start_link/8,
           add_child/1,
           init/1 ]).
 
-start_link( ManagerPid, ProxyRef, Module, Args, Options, MaxR, MaxT ) ->
+start_link( ManagerPid, ProxyRef, MaxWorkerAgeMS, Module, Args, Options, MaxR, MaxT ) ->
   supervisor:start_link( ?MODULE,
-                         [ ManagerPid, ProxyRef, Module, Args, Options, MaxR, MaxT ] ).
+                         [ ManagerPid, ProxyRef, MaxWorkerAgeMS, Module, Args, Options, MaxR, MaxT ] ).
 
 add_child( SupRef ) ->
   supervisor:start_child( SupRef, [] ).
 
-init( [ ManagerPid, ProxyRef, Module, Args, Options, MaxR, MaxT ] ) ->
+init( [ ManagerPid, ProxyRef, MaxWorkerAgeMS, Module, Args, Options, MaxR, MaxT ] ) ->
   { ok,
    { { simple_one_for_one, MaxR, MaxT },
      [ { pool_name( Module ),
-         { gen_server_pool_proxy, start_link, [ ManagerPid, ProxyRef,
-                                                Module, Args, Options ] },
+         { gen_server_pool_proxy, start_link,
+           [ ManagerPid, ProxyRef, MaxWorkerAgeMS, Module, Args, Options ] },
          transient, 2000, worker, [ Module ] } ] } }.
 
 pool_name( Module ) ->

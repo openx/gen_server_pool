@@ -10,8 +10,10 @@
 
 -behaviour(gen_server).
 
+-include("gen_server_pool_internal.hrl").
+
 %% API
--export([ start_link/5,
+-export([ start_link/6,
           stop/2 ]).
 
 %% gen_server callbacks
@@ -26,16 +28,16 @@
                   proxy_ref,
                   module,
                   noreply_target,
-                  worker_starttime,
+                  worker_start_time,
+                  worker_end_time,
                   state
                 } ).
 
 %%====================================================================
 %% API
 %%====================================================================
-start_link( MgrPid, ProxyRef, Module, Args, Options ) ->
-  gen_server:start_link( ?MODULE,
-                         [ MgrPid, ProxyRef, Module, Args ], Options ).
+start_link( MgrPid, ProxyRef, MaxWorkerAgeMS, Module, Args, Options ) ->
+  gen_server:start_link( ?MODULE, [ MgrPid, ProxyRef, MaxWorkerAgeMS, Module, Args ], Options ).
 
 stop( Pid, ProxyRef ) ->
   gen_server:call( Pid, { ProxyRef, stop } ).
@@ -44,19 +46,22 @@ stop( Pid, ProxyRef ) ->
 %% gen_server callbacks
 %%====================================================================
 
-init( [ MgrPid, ProxyRef, Module, Args ] ) ->
+init( [ MgrPid, ProxyRef, MaxWorkerAgeMS, Module, Args ] ) ->
+  Now = os:timestamp(),
+  random:seed(Now),
+
   PState = #state{ manager_pid = MgrPid,
                    proxy_ref   = ProxyRef,
                    module      = Module,
-                   worker_starttime = os:timestamp()
-                    },
+                   worker_start_time = Now,
+                   worker_end_time = worker_end_time( MaxWorkerAgeMS, Now ) },
 
   case Module:init( Args ) of
     { ok, State } ->
-      gen_server_pool:available( MgrPid, ProxyRef, self(), PState#state.worker_starttime ),
+      gen_server_pool:available( MgrPid, ProxyRef, self(), PState#state.worker_end_time, ?GSP_FLAG_INITIAL ),
       { ok, state( PState, State ) };
     { ok, State, Extra } ->
-      gen_server_pool:available( MgrPid, ProxyRef, self(), PState#state.worker_starttime ),
+      gen_server_pool:available( MgrPid, ProxyRef, self(), PState#state.worker_end_time, ?GSP_FLAG_INITIAL ),
       { ok, state( PState, State ), Extra };
     Other ->
       Other
@@ -73,7 +78,7 @@ handle_call( Msg,
              #state{ manager_pid = MgrPid,
                      proxy_ref   = ProxyRef,
                      module      = M,
-                     worker_starttime = WorkerStartTime,
+                     worker_end_time = WorkerEndTime,
                      state       = S } = PState ) ->
   % we are switching out the pid in the From field with the pid of this
   % proxy, since if an embedded gen_server is using gen_server:reply/2
@@ -81,10 +86,10 @@ handle_call( Msg,
   % available.
   case M:handle_call( Msg, { self(), FromRef }, S ) of
     { reply, Reply, NewS } ->
-      gen_server_pool:available( MgrPid, ProxyRef, self(), WorkerStartTime ),
+      gen_server_pool:available( MgrPid, ProxyRef, self(), WorkerEndTime, ?GSP_FLAG_NONE ),
       { reply, Reply, state( PState, NewS ) };
     { reply, Reply, NewS, Extra } ->
-      gen_server_pool:available( MgrPid, ProxyRef, self(), WorkerStartTime ),
+      gen_server_pool:available( MgrPid, ProxyRef, self(), WorkerEndTime, ?GSP_FLAG_NONE ),
       { reply, Reply, state( PState, NewS ), Extra };
     { noreply, NewS } ->
       { noreply, state( PState#state{ noreply_target = From }, NewS ) };
@@ -101,14 +106,14 @@ handle_cast( Msg,
              #state{ manager_pid = MgrPid,
                      proxy_ref   = ProxyRef,
                      module      = M,
-                     worker_starttime = WorkerStartTime,
+                     worker_end_time = WorkerEndTime,
                      state       = S } = PState ) ->
   case M:handle_cast( Msg, S ) of
     { noreply, NewS } ->
-      gen_server_pool:available( MgrPid, ProxyRef, self(), WorkerStartTime ),
+      gen_server_pool:available( MgrPid, ProxyRef, self(), WorkerEndTime, ?GSP_FLAG_NONE ),
       { noreply, state( PState, NewS ) };
     { noreply, NewS, Extra } ->
-      gen_server_pool:available( MgrPid, ProxyRef, self(), WorkerStartTime ),
+      gen_server_pool:available( MgrPid, ProxyRef, self(), WorkerEndTime, ?GSP_FLAG_NONE ),
       { noreply, state( PState, NewS ), Extra };
     { stop, Reason, NewS } ->
       { stop, Reason, state( PState, NewS ) }
@@ -122,11 +127,11 @@ handle_cast( Msg,
 handle_info( {Tag, ProxyMsg},
              #state{ manager_pid = MgrPid,
                      proxy_ref = ProxyRef,
-                     worker_starttime = WorkerStartTime,
+                     worker_end_time = WorkerEndTime,
                      noreply_target = {Target,Tag}
                    } = PState ) ->
   Target ! { Tag, ProxyMsg },
-  gen_server_pool:available( MgrPid, ProxyRef, self(), WorkerStartTime ),
+  gen_server_pool:available( MgrPid, ProxyRef, self(), WorkerEndTime, ?GSP_FLAG_NONE ),
   { noreply, PState#state{ noreply_target = undefined } };
 handle_info( Msg,
              #state{ module      = M,
@@ -158,6 +163,15 @@ code_change( OldVsn,
 %%--------------------------------------------------------------------
 state( ProxyState, State ) ->
   ProxyState#state{ state = State }.
+
+worker_end_time( MaxWorkerAgeMS, Now ) when is_integer( MaxWorkerAgeMS ), MaxWorkerAgeMS > 0 ->
+  gen_server_pool:now_add( Now, MaxWorkerAgeMS * 1000 );
+worker_end_time( { MaxWorkerAgeMS, JitterMS }, Now ) when is_integer(MaxWorkerAgeMS), is_integer(JitterMS) ->
+  worker_end_time( MaxWorkerAgeMS + random:uniform( JitterMS ), Now );
+worker_end_time( { Module, Function, Args }, Now ) when is_atom( Module ), is_atom( Function ), is_list( Args ) ->
+  worker_end_time( apply( Module, Function, Args ), Now );
+worker_end_time( infinity, _Now ) ->
+  infinity.
 
 
 %%--------------------------------------------------------------------
