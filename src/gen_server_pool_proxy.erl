@@ -40,7 +40,7 @@ start_link( MgrPid, ProxyRef, MaxWorkerAgeMS, Module, Args, Options ) ->
   gen_server:start_link( ?MODULE, [ MgrPid, ProxyRef, MaxWorkerAgeMS, Module, Args ], Options ).
 
 stop( Pid, ProxyRef ) ->
-  gen_server:call( Pid, { ProxyRef, stop } ).
+  gen_server:cast( Pid, { ProxyRef, stop } ).
 
 %%====================================================================
 %% gen_server callbacks
@@ -101,6 +101,10 @@ handle_call( Msg,
       { stop, Reason, state( PState, NewS ) }
   end.
 
+
+handle_cast( { ProxyRef, stop },
+             #state{ proxy_ref = ProxyRef } = PState ) ->
+  { stop, normal, PState };
 
 handle_cast( Msg,
              #state{ manager_pid = MgrPid,
