@@ -1,3 +1,6 @@
+Version 2.4.1 Anthony Molinaro (anthony.molinaro@openx.com)
+  * minor tweaks to compile with erlang >= 18
+
 Version 2.4.0 David Hull (david.hull@openx.com)
   * Fixed several bugs.
   * When a new worker is started because a request is received when

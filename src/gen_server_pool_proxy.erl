@@ -48,7 +48,6 @@ stop( Pid, ProxyRef ) ->
 
 init( [ MgrPid, ProxyRef, MaxWorkerAgeMS, Module, Args ] ) ->
   Now = os:timestamp(),
-  random:seed(Now),
 
   PState = #state{ manager_pid = MgrPid,
                    proxy_ref   = ProxyRef,
@@ -167,7 +166,7 @@ state( ProxyState, State ) ->
 worker_end_time( MaxWorkerAgeMS, Now ) when is_integer( MaxWorkerAgeMS ), MaxWorkerAgeMS > 0 ->
   gen_server_pool:now_add( Now, MaxWorkerAgeMS * 1000 );
 worker_end_time( { MaxWorkerAgeMS, JitterMS }, Now ) when is_integer(MaxWorkerAgeMS), is_integer(JitterMS) ->
-  worker_end_time( MaxWorkerAgeMS + random:uniform( JitterMS ), Now );
+  worker_end_time( MaxWorkerAgeMS + rand:uniform( JitterMS ), Now );
 worker_end_time( { Module, Function, Args }, Now ) when is_atom( Module ), is_atom( Function ), is_list( Args ) ->
   worker_end_time( apply( Module, Function, Args ), Now );
 worker_end_time( infinity, _Now ) ->
